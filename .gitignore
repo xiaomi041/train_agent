@@ -1,0 +1,17 @@
+# 密钥配置文件（绝对不能上传）
+.env
+
+# Python虚拟环境
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 12306站点缓存
+stations.json
+
+# PyCharm
+.idea/
+
+# 临时文件
+_patch*.py
