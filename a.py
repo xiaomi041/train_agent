@@ -1,8 +1,8 @@
 """
 AI 火车票查询助手（12306 官方接口版）
 - 数据：12306 官方余票查询接口（免费、无限制）
-- AI：DeepSeek + Agno Agent
-- 界面：Streamlit
+- AI：DeepSeek + Agno Agent（多轮对话 + 知识库 RAG）
+- 界面：Streamlit 聊天式界面
 """
 import os
 import json
@@ -22,6 +22,7 @@ SKIP_SSL = os.getenv("SKIP_SSL_VERIFY", "0") == "1"
 VERIFY = False if SKIP_SSL else certifi.where()
 
 STATION_CACHE = Path(__file__).parent / "stations.json"
+KNOWLEDGE_FILE = Path(__file__).parent / "train_knowledge.md"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -34,7 +35,6 @@ SEAT_CODE_MAP = {
     "A": "高级软卧", "F": "动卧", "C": "软座",
 }
 
-# 余票字段索引（12306 固定位置）
 REMAIN_INDEX = {
     "商务座": 29, "一等座": 30, "二等座": 31,
     "软卧": 28, "硬卧": 26, "硬座": 24, "无座": 23,
@@ -42,38 +42,46 @@ REMAIN_INDEX = {
 
 
 def parse_prices(seat_types: str, price_str: str) -> dict:
-    """从 [35] 席别代码串和 [39] 价格串解析各席别票价（单位：元）。"""
     prices = {}
     if not price_str:
         return prices
     for i, code in enumerate(seat_types):
-        start = i * 10
-        end = start + 10
+        start, end = i * 10, i * 10 + 10
         if end > len(price_str):
             break
         digits = price_str[start + 1:end]
         try:
-            price = int(digits[:5]) / 10.0
+            prices[SEAT_CODE_MAP.get(code, code)] = int(digits[:5]) / 10.0
         except (ValueError, IndexError):
             continue
-        name = SEAT_CODE_MAP.get(code, code)
-        prices[name] = price
     return prices
 
 
-# ========== 12306 会话与站点映射 ==========
+# ========== 12306 会话与站点映射（全局单例，避免重复握手触发反爬） ==========
+_session = None
+_station_map = None
+
+
 def get_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(HEADERS)
-    s.get("https://kyfw.12306.cn/otn/leftTicket/init", timeout=15, verify=VERIFY)
-    return s
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        _session.headers.update(HEADERS)
+        try:
+            _session.get("https://kyfw.12306.cn/otn/leftTicket/init",
+                         timeout=15, verify=VERIFY)
+        except Exception:
+            pass
+    return _session
 
 
-@st.cache_resource(show_spinner=False)
 def get_station_map() -> dict:
-    """站点名称→三字码映射，优先读本地缓存。"""
+    global _station_map
+    if _station_map is not None:
+        return _station_map
     if STATION_CACHE.exists():
-        return json.loads(STATION_CACHE.read_text(encoding="utf-8"))
+        _station_map = json.loads(STATION_CACHE.read_text(encoding="utf-8"))
+        return _station_map
     s = get_session()
     r = s.get(
         "https://kyfw.12306.cn/otn/resources/js/framework/station_name.js",
@@ -87,17 +95,13 @@ def get_station_map() -> dict:
             if name and code:
                 mapping[name] = code
     STATION_CACHE.write_text(json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
+    _station_map = mapping
     return mapping
 
 
 # ========== 工具：查询站到站余票 ==========
 def query_train_ticket(start_station: str, end_station: str, travel_date: str) -> str:
-    """
-    查询站到站火车票余票。
-    :param start_station: 出发站中文名，如 "十堰东"
-    :param end_station:   到达站中文名，如 "武汉"
-    :param travel_date:   出行日期 YYYY-MM-DD
-    """
+    """查询站到站火车票余票和票价。"""
     station_map = get_station_map()
     from_code = station_map.get(start_station.strip())
     to_code = station_map.get(end_station.strip())
@@ -133,19 +137,14 @@ def query_train_ticket(start_station: str, end_station: str, travel_date: str) -
     trains = []
     for row in results:
         f = row.split("|")
-        # 解析各席别余票
         seats = {}
         for seat_name, idx in REMAIN_INDEX.items():
             remain = f[idx].strip() if idx < len(f) else ""
             if remain:
                 seats[seat_name] = {"remain": remain}
-        # 解析各席别票价，合并到 seats
         prices = parse_prices(f[35], f[39])
         for seat_name, price in prices.items():
-            if seat_name in seats:
-                seats[seat_name]["price"] = price
-            else:
-                seats[seat_name] = {"price": price}
+            seats.setdefault(seat_name, {})["price"] = price
 
         trains.append({
             "train_no": f[3],
@@ -162,11 +161,7 @@ def query_train_ticket(start_station: str, end_station: str, travel_date: str) -
 
 # ========== 工具：中转方案计算 ==========
 def calc_transfer_scheme(train1_json: str, train2_json: str) -> str:
-    """
-    传入两段查询结果，枚举所有可行中转组合，返回：
-    - 二等座总价最低方案
-    - 全程总时间最短方案（含中转等待）
-    """
+    """枚举所有中转组合，返回最便宜和最快方案。"""
     t1 = json.loads(train1_json)
     t2 = json.loads(train2_json)
     if "error" in t1 or "error" in t2:
@@ -195,10 +190,8 @@ def calc_transfer_scheme(train1_json: str, train2_json: str) -> str:
             total_min = int((arr2 - dep1).total_seconds() / 60)
             p2 = _second_price(seg2)
             total_price = (p1 + p2) if (p1 is not None and p2 is not None) else None
-
             schemes.append({
-                "seg1": seg1,
-                "seg2": seg2,
+                "seg1": seg1, "seg2": seg2,
                 "transfer_wait_min": wait_min,
                 "total_minutes": total_min,
                 "total_second_price": total_price,
@@ -217,14 +210,23 @@ def calc_transfer_scheme(train1_json: str, train2_json: str) -> str:
     }, ensure_ascii=False)
 
 
+# ========== 加载知识库 ==========
+def load_knowledge() -> str:
+    if KNOWLEDGE_FILE.exists():
+        return KNOWLEDGE_FILE.read_text(encoding="utf-8")
+    return ""
+
+
 # ========== Streamlit 界面 ==========
 st.set_page_config(page_title="AI 火车票查询", page_icon="🚄", layout="wide")
 st.title("🚄 AI 火车票查询助手")
-st.caption("数据源：12306 官方接口 · 免费无限次 · AI 帮你整理结果")
+st.caption("12306 官方数据 · 多轮对话 · 乘车知识问答 · 免费无限次")
 
 if not DEEPSEEK_API_KEY:
     st.error("未配置 DEEPSEEK_API_KEY，请检查 .env 文件")
     st.stop()
+
+knowledge = load_knowledge()
 
 
 @st.cache_resource
@@ -232,29 +234,36 @@ def get_agent():
     return Agent(
         model=DeepSeek(api_key=DEEPSEEK_API_KEY),
         tools=[query_train_ticket, calc_transfer_scheme],
-        instructions="""你是火车票查询助手。
+        instructions=f"""你是火车票查询助手，支持多轮对话和乘车知识问答。
 
-工具说明：
-- query_train_ticket(start, end, date)：查询站到站车次，返回每趟车的车次号、出发到达站、出发到达时间、历时、各席别信息。每个席别包含 remain（余票，"有"或数字）和 price（票价，元）。
-- calc_transfer_scheme(第一段json, 第二段json)：传入两段查询结果，枚举所有可行中转组合，返回 cheapest（二等座总价最低）、fastest（总时间最短）、top5_by_price、top5_by_time。
+## 知识库（用户问退票、改签、儿童票等规则时参考）
+{knowledge}
 
-输出规则：
-1. 直达查询：
-   (a) 先放"全部车次"完整表格，列：车次、出发站、到达站、出发时间、到达时间、历时、然后每个有票席别一列，格式为"价格元/余票"（如"243元/有"或"221元/14张"）。必须列出所有车次，不要省略。
-   (b) 表格后单独标出"🚀 最快"和"💰 二等座最便宜"分别是哪趟车。
-2. 中转查询：
-   (a) 先展示 cheapest（二等座总价最低）和 fastest（全程最快）两个方案，分别列出两段车次、出发到达时间、等待时间、总票价、总耗时。
-   (b) 然后分别列出"A→中转站 全部车次"和"中转站→B 全部车次"两个完整表格，格式同直达查询。
-3. 余票数字小于5的标注"⚠️紧张"。
-4. 票价为0或缺失的席别不要显示。
-5. 站名必须是12306官方站名（如"十堰东"不是"十堰"），查不到就提示用户确认。
-6. 语言简洁。
+## 工具说明
+- query_train_ticket(start, end, date)：查询站到站车次，返回车次号、出发到达站、时间、历时、各席别 remain（余票）和 price（票价元）。
+- calc_transfer_scheme(第一段json, 第二段json)：枚举所有中转组合，返回 cheapest（二等座总价最低）、fastest（总时间最短）、top5_by_price、top5_by_time。
+
+## 输出规则
+1. 查车次：用 markdown 表格列出所有车次，列：车次、出发站、到达站、出发时间、到达时间、历时、各席别(价格/余票)。表格后标出"🚀 最快"和"💰 最便宜"。
+2. 中转查询：先展示 cheapest 和 fastest，再分别列出两段全部车次表。
+3. 余票少于5张标"⚠️紧张"。
+4. 票价为0或缺失的席别不显示。
+5. 用户问规则类问题（退票、改签、儿童票等），直接根据知识库回答，不用调工具。
+6. 站名必须是12306官方站名（如"十堰东"不是"十堰"），查不到提示确认。
+7. 支持多轮对话：用户说"那换乘呢"、"下午的车呢"等，结合上下文理解意图。
+8. 语言简洁。
 """,
     )
 
 
 agent = get_agent()
 
+# ========== 界面：表单查询 + 聊天追问 ==========
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# 顶部表单
+st.subheader("🔍 查询")
 col1, col2, col3 = st.columns(3)
 with col1:
     start = st.text_input("出发站", value="十堰东")
@@ -262,19 +271,46 @@ with col2:
     transfer = st.text_input("中转站（不需要就留空）", value="")
 with col3:
     end = st.text_input("到达站", value="武汉")
-
 date = st.date_input("出行日期", value=datetime.now().date())
 
-if st.button("🔍 开始查询", type="primary", use_container_width=True):
+if st.button("查询", type="primary", use_container_width=True):
     date_str = date.strftime("%Y-%m-%d")
-    with st.spinner("AI 正在帮你查 12306..."):
-        if transfer.strip():
-            prompt = (
-                f"帮我查 {start} → {transfer} → {end} 的中转方案，"
-                f"出行日期 {date_str}。先分段查询，再计算中转组合。"
-            )
-        else:
-            prompt = f"帮我查 {start} 到 {end}，{date_str} 的所有直达车次余票。"
+    if transfer.strip():
+        prompt = f"帮我查 {start} → {transfer} → {end} 的中转方案，出行日期 {date_str}。先分段查询，再计算中转组合。"
+    else:
+        prompt = f"帮我查 {start} 到 {end}，{date_str} 的所有直达车次余票。"
+    st.session_state.messages.append({"role": "user", "content": prompt})
 
-        result = agent.run(prompt)
-        st.markdown(result.content)
+# 显示历史消息
+st.divider()
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+if not st.session_state.messages:
+    st.info("👆 在上面填出发站、到达站和日期，点查询就行。也可以在下方聊天框追问，比如'那下午的车呢'、'退票怎么收费'。")
+
+# 聊天追问
+if prompt := st.chat_input("追问或直接输入问题..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+# 统一处理 AI 回复（表单查询和聊天共用）
+if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
+    with st.chat_message("assistant"):
+        with st.spinner("AI 正在查询..."):
+            history_text = ""
+            for m in st.session_state.messages[:-1]:
+                history_text += f"用户：{m['content']}\n" if m["role"] == "user" else f"助手：{m['content']}\n"
+            last_q = st.session_state.messages[-1]["content"]
+            full_prompt = f"之前的对话：\n{history_text}\n用户现在问：{last_q}" if history_text else last_q
+            result = agent.run(full_prompt)
+            st.markdown(result.content)
+            st.session_state.messages.append({"role": "assistant", "content": result.content})
+
+# 侧边栏清空
+if st.session_state.messages:
+    if st.sidebar.button("🗑️ 清空对话"):
+        st.session_state.messages = []
+        st.rerun()
