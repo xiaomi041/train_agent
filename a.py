@@ -400,8 +400,17 @@ def load_knowledge() -> str:
 
 
 # ========== Streamlit 界面 ==========
-st.set_page_config(page_title="AI 火车票查询", page_icon="🚄", layout="wide")
-st.title("🚄 眯哥的火车票查询助手")
+import base64
+st.set_page_config(page_title="AI 火车票查询", page_icon="logo.jpg", layout="wide")
+with open("logo.jpg", "rb") as _f:
+    _logo_b64 = base64.b64encode(_f.read()).decode()
+st.markdown(
+    f'<div style="display:flex;align-items:center;gap:12px">'
+    f'<img src="data:image/jpeg;base64,{_logo_b64}" style="width:64px;height:64px;border-radius:10px">'
+    f'<h1 style="margin:0;font-size:2.4rem;font-weight:700">眯哥的火车票查询助手</h1>'
+    f'</div>',
+    unsafe_allow_html=True
+)
 st.caption("12306 官方数据 · 多轮对话 · 最快/最省路线 · 乘车知识问答 · 免费无限次")
 st.info("💡 **怎么用**：填好出发、到达和日期，点「查询」看直达或中转车次；想找最便宜或最快的中转路线，点「🚀 自动搜索最优路线」，记得勾选可考虑的中转站/地区，减少搜索时间。下面聊天框还能直接问问题，比如告诉我明天重庆站到杭州站最省钱的路线。")
 
