@@ -183,7 +183,7 @@ def query_train_ticket(start_station: str, end_station: str, travel_date: str) -
 
 
 # ========== 工具：中转方案计算 ==========
-def calc_transfer_scheme(train1_json: str, train2_json: str) -> str:
+def calc_transfer_scheme(train1_json: str, train2_json: str, max_wait_min: int = 720) -> str:
     """枚举所有中转组合，返回最便宜和最快方案。"""
     t1 = json.loads(train1_json)
     t2 = json.loads(train2_json)
@@ -220,11 +220,16 @@ def calc_transfer_scheme(train1_json: str, train2_json: str) -> str:
             if arr1 > dep2:
                 continue
             wait_min = int((dep2 - arr1).total_seconds() / 60)
+            if wait_min > max_wait_min:  # 中转等待超过上限（默认12小时）视为不合理方案，排除
+                continue
             total_min = int((arr2 - dep1).total_seconds() / 60)
             p2 = _min_price(seg2)
             total_price = (p1 + p2) if (p1 is not None and p2 is not None) else None
+            seg2_out = dict(seg2)
+            seg2_out["departure_next_day"] = dep2.day > arr1.day
+            seg2_out["arrival_next_day"] = arr2.day > dep1.day
             schemes.append({
-                "seg1": seg1, "seg2": seg2,
+                "seg1": seg1, "seg2": seg2_out,
                 "transfer_wait_min": wait_min,
                 "total_minutes": total_min,
                 "total_second_price": total_price,
@@ -558,7 +563,9 @@ if auto_search:
 
         cheapest_name = priced[0][0] if priced else None
 
-        row = f"| **{train['train_no']}** | {train['departure_time']} | {train['arrival_time']} | {train.get('duration', '-')} |"
+        dep_tag = "（次日）" if train.get("departure_next_day") else ""
+        arr_tag = "（次日）" if train.get("arrival_next_day") else ""
+        row = f"| **{train['train_no']}** | {train['departure_time']}{dep_tag} | {train['arrival_time']}{arr_tag} | {train.get('duration', '-')} |"
         for seat_name in ["商务座", "一等座", "二等座", "软卧", "硬卧", "硬座", "无座"]:
             info = seats.get(seat_name, {})
             price = info.get("price")
