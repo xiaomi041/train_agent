@@ -506,33 +506,34 @@ with st.expander("🎛️ 选择中转城市（自动搜索时只搜选中的城
     if "selected_hubs" not in st.session_state:
         st.session_state.selected_hubs = list(ALL_HUBS)
 
+    options_with_region = []
+    for region, cities in HUB_STATIONS_BY_REGION.items():
+        for c in cities:
+            options_with_region.append(f"[{region}] {c}")
+    display_to_city = {f"[{r}] {c}": c for r, cs in HUB_STATIONS_BY_REGION.items() for c in cs}
+    city_to_display = {v: k for k, v in display_to_city.items()}
+
+    if "selected_hubs_display" not in st.session_state:
+        st.session_state.selected_hubs_display = [
+            city_to_display[c] for c in st.session_state.selected_hubs if c in city_to_display
+        ]
+
     col_sel1, col_sel2 = st.columns([1, 3])
     with col_sel1:
         if st.button("✅ 全选", use_container_width=True):
-            st.session_state.selected_hubs = list(ALL_HUBS)
+            st.session_state.selected_hubs_display = list(options_with_region)
             st.rerun()
         if st.button("🗑️ 清空", use_container_width=True):
-            st.session_state.selected_hubs = []
+            st.session_state.selected_hubs_display = []
             st.rerun()
     with col_sel2:
-        options_with_region = []
-        for region, cities in HUB_STATIONS_BY_REGION.items():
-            for c in cities:
-                options_with_region.append(f"[{region}] {c}")
-
-        display_to_city = {f"[{r}] {c}": c for r, cs in HUB_STATIONS_BY_REGION.items() for c in cs}
-        city_to_display = {v: k for k, v in display_to_city.items()}
-
-        default_display = [city_to_display[c] for c in st.session_state.selected_hubs if c in city_to_display]
-
-        selected_display = st.multiselect(
+        st.multiselect(
             "中转城市（可搜索、可多选）",
             options=options_with_region,
-            default=default_display,
+            key="selected_hubs_display",
             help="只勾选你想考虑的中转城市，不勾远的地方能省很多时间",
         )
-
-        st.session_state.selected_hubs = [display_to_city[d] for d in selected_display]
+        st.session_state.selected_hubs = [display_to_city[d] for d in st.session_state.selected_hubs_display]
 
     st.caption(f"当前选中 {len(st.session_state.selected_hubs)} / {len(ALL_HUBS)} 个城市")
 
