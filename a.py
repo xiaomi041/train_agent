@@ -109,6 +109,18 @@ def get_city_stations(name: str) -> list:
     return matched if matched else [name]
 
 
+# ========== 工具：获取今天日期（解决"今天/明天"相对时间问题） ==========
+def get_today() -> str:
+    """获取今天日期，返回格式 YYYY-MM-DD。用户说'今天''明天''后天'时必须先调本工具得到真实日期。"""
+    from datetime import date, timedelta
+    today = date.today()
+    return json.dumps({
+        "today": today.isoformat(),
+        "tomorrow": (today + timedelta(days=1)).isoformat(),
+        "day_after_tomorrow": (today + timedelta(days=2)).isoformat(),
+    }, ensure_ascii=False)
+
+
 # ========== 工具：查询站到站余票 ==========
 def query_train_ticket(start_station: str, end_station: str, travel_date: str) -> str:
     """查询站到站火车票余票和票价。session失效时自动重试一次。"""
@@ -431,15 +443,28 @@ knowledge = load_knowledge()
 def get_agent():
     return Agent(
         model=DeepSeek(api_key=DEEPSEEK_API_KEY),
-        tools=[query_train_ticket, calc_transfer_scheme],
+        tools=[get_today, query_train_ticket, calc_transfer_scheme],
         instructions=f"""你是火车票查询助手，支持多轮对话和乘车知识问答。
 
 ## 知识库（用户问退票、改签、儿童票等规则时参考）
 {knowledge}
 
 ## 工具说明
+- get_today()：获取今天/明天/后天日期（格式 YYYY-MM-DD）。用户说"今天""明天""下周三"等相对时间时，必须先调本工具拿到真实日期，禁止自己编日期。
 - query_train_ticket(start, end, date)：查询站到站车次，返回车次号、出发到达站、时间、历时、各席别 remain（余票）和 price（票价元）。
 - calc_transfer_scheme(第一段json, 第二段json)：枚举所有中转组合，返回 cheapest（二等座总价最低）、fastest（总时间最短）、top5_by_price、top5_by_time。
+
+## 推理流程（必须严格遵守 ReAct 多步推理）
+涉及路线推荐 / 怎么走划算 / 哪条路好走类问题时，禁止一次工具调用后直接回答，必须按以下顺序走完全程：
+1.【思考】先判断用户需求，明确要查哪几类方案；
+2.【行动1】调用 query_train_ticket 查询直达车次；
+3.【观察】分析直达结果：有几趟、最快多久、最便宜多少；
+4.【行动2】调用 calc_transfer_scheme 查询中转组合；
+5.【观察】对比中转结果与直达结果的价差、时间差；
+6.【行动3】如果直达/中转数据不全或用户追问细节，再次调用工具补充查询；
+7.【回答】综合以上所有观察结果，给出推荐。
+回答开头必须用一句话简述："我查了直达 X 趟 + 中转最优 X 个方案，对比如下："，让用户看到你的推理过程。
+规则类问题（退票/改签/儿童票）不调工具，直接根据知识库回答。
 
 ## 输出规则
 1. 查车次：用 markdown 表格列出所有车次，列：车次、出发站、到达站、出发时间、到达时间、历时、各席别(价格/余票)。表格后标出"🚀 最快"和"💰 最便宜"。
