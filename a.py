@@ -416,6 +416,61 @@ def load_knowledge() -> str:
     return ""
 
 
+# ========== RAG 知识库（向量检索，替代全文注入） ==========
+import numpy as np
+from fastembed import TextEmbedding
+
+_embed_model = None
+_knowledge_chunks = None
+_knowledge_vectors = None
+
+
+def _split_knowledge(text: str) -> list:
+    """把 markdown 知识库按二级标题切块，每块带标题上下文。"""
+    blocks = []
+    title, lines = "", []
+    for line in text.splitlines():
+        if line.startswith("## "):
+            if lines:
+                blocks.append((title, "\n".join(lines)))
+            title, lines = line[3:].strip(), []
+        elif line.strip():
+            lines.append(line.strip())
+    if lines:
+        blocks.append((title, "\n".join(lines)))
+    return blocks
+
+
+def _ensure_knowledge_index():
+    """启动时加载一次 Embedding 模型并向量化全部知识块（缓存）。"""
+    global _embed_model, _knowledge_chunks, _knowledge_vectors
+    if _knowledge_vectors is not None:
+        return
+    _knowledge_chunks = _split_knowledge(load_knowledge())
+    _embed_model = TextEmbedding("BAAI/bge-small-zh-v1.5")
+    texts = [f"{t}\n{c}" for t, c in _knowledge_chunks]
+    _knowledge_vectors = np.array(list(_embed_model.embed(texts)), dtype=np.float32)
+
+
+def search_knowledge(query: str, top_k: int = 3) -> str:
+    """RAG 向量检索工具：把用户问题转成向量，与知识库做余弦相似度，返回 Top-K 相关条文。
+    用户问退票/改签/儿童票/学生票等乘车规则时必须先调用本工具，基于检索结果回答。"""
+    _ensure_knowledge_index()
+    qv = np.array(list(_embed_model.embed([query]))[0], dtype=np.float32)
+    dots = _knowledge_vectors @ qv
+    norms = np.linalg.norm(_knowledge_vectors, axis=1) * np.linalg.norm(qv) + 1e-9
+    scores = dots / norms
+    top_idx = np.argsort(scores)[::-1][:top_k]
+    results = []
+    for i in top_idx:
+        if scores[i] < 0.2:  # 相似度过低视为无关
+            continue
+        results.append(f"[知识块·相似度{scores[i]:.2f}] {_knowledge_chunks[i][0]}\n{_knowledge_chunks[i][1]}")
+    if not results:
+        return "未检索到相关规则，请如实告知用户知识库中没有该内容。"
+    return "\n\n".join(results)
+
+
 # ========== Streamlit 界面 ==========
 import base64
 st.set_page_config(page_title="AI 火车票查询", page_icon="logo.jpg", layout="wide")
@@ -436,23 +491,45 @@ if not DEEPSEEK_API_KEY:
     st.error("未配置 DEEPSEEK_API_KEY，请检查 .env 文件")
     st.stop()
 
-knowledge = load_knowledge()
+
+# ========== L5 多智能体：评审 Agent（Critic） ==========
+# 独立于主 Agent，专门对候选出行方案做独立挑刺
+_critic_agent = None
+
+def review_plan(plan_summary: str) -> str:
+    """主 Agent 调用：对候选出行方案做独立评审，挑出换乘时间不合理、余票紧张、站名不一致、价格对比遗漏等问题。
+    plan_summary 是主 Agent 整理好的候选方案摘要（含车次、时间、换乘等待、票价、余票）。
+    返回评审结论：有问题列出问题并建议修正方向，没问题返回'通过'。"""
+    global _critic_agent
+    if _critic_agent is None:
+        _critic_agent = Agent(
+            model=DeepSeek(api_key=DEEPSEEK_API_KEY),
+            instructions="""你是严格的出行方案评审专家。你不直接查票，只对主 Agent 提交的候选方案做独立挑刺。
+重点检查：
+1. 换乘等待时间：小于15分钟赶不上车，大于4小时浪费时间——有问题要指出；
+2. 余票状态：标注"无票"/"候补"的车次不能作为推荐；
+3. 站名一致性：两段车次是否在同一个站换乘（重庆西 vs 重庆北是不同站）；
+4. 价格对比：主 Agent 说的"最便宜"是否真的对比了所有候选；
+5. 时间合理性：到达时间是否次日、总历时是否过长。
+输出格式：先给结论"通过"或"需修正"，再列具体问题（每条一行），不要复述方案细节。""",
+        )
+    result = _critic_agent.run(f"请评审以下出行方案：\n{plan_summary}")
+    return result.content
 
 
 @st.cache_resource
 def get_agent():
     return Agent(
         model=DeepSeek(api_key=DEEPSEEK_API_KEY),
-        tools=[get_today, query_train_ticket, calc_transfer_scheme],
+        tools=[get_today, query_train_ticket, calc_transfer_scheme, review_plan, search_knowledge],
         instructions=f"""你是火车票查询助手，支持多轮对话和乘车知识问答。
-
-## 知识库（用户问退票、改签、儿童票等规则时参考）
-{knowledge}
 
 ## 工具说明
 - get_today()：获取今天/明天/后天日期（格式 YYYY-MM-DD）。用户说"今天""明天""下周三"等相对时间时，必须先调本工具拿到真实日期，禁止自己编日期。
 - query_train_ticket(start, end, date)：查询站到站车次，返回车次号、出发到达站、时间、历时、各席别 remain（余票）和 price（票价元）。
 - calc_transfer_scheme(第一段json, 第二段json)：枚举所有中转组合，返回 cheapest（二等座总价最低）、fastest（总时间最短）、top5_by_price、top5_by_time。
+- review_plan(方案摘要)：把你整理的候选方案交给独立评审 Agent 挑刺，检查换乘时间、余票、站名一致性、价格对比。最终推荐前必须调用一次。
+- search_knowledge(query)：RAG 向量检索工具。用户问退票/改签/儿童票/学生票/购票时间/换乘建议/席别等乘车规则问题时，必须先调用本工具检索知识库，再基于检索结果回答，禁止凭记忆编造规则。
 
 ## 推理流程（必须严格遵守 ReAct 多步推理）
 涉及路线推荐 / 怎么走划算 / 哪条路好走类问题时，禁止一次工具调用后直接回答，必须按以下顺序走完全程：
@@ -464,7 +541,18 @@ def get_agent():
 6.【行动3】如果直达/中转数据不全或用户追问细节，再次调用工具补充查询；
 7.【回答】综合以上所有观察结果，给出推荐。
 回答开头必须用一句话简述："我查了直达 X 趟 + 中转最优 X 个方案，对比如下："，让用户看到你的推理过程。
-规则类问题（退票/改签/儿童票）不调工具，直接根据知识库回答。
+规则类问题（退票/改签/儿童票等）不查车票，必须先调用 search_knowledge 检索知识库，基于检索到的条文回答。
+
+## 规划（Planning）
+接到模糊任务（如"帮我安排国庆回家""怎么走最划算"）时，在调工具前先用一行简短列出你打算分几步做，例如："我的计划：①先查直达车次 ②再枚举中转方案 ③对比后给推荐。"——让用户看到你的任务拆解思路。
+
+## 反思（Reflection，回答前必须做一次自检）
+给出最终推荐前，**必须调用 review_plan 工具**把候选方案交给独立评审 Agent 挑刺：
+1.【数据完整性】我查的数据是不是完整？有没有只查了直达没查中转就急着推荐？
+2.【方案合理性】推荐的中转方案，换乘等待时间是不是合理？（小于15分钟赶不上、大于4小时浪费时间）——有这种问题要主动指出或剔除；
+3.【价格准确性】我说的"最便宜"是不是真的把直达和中转都对比过？有没有漏掉更便宜的组合？
+4.【站名一致性】两段车次是不是在同一个站换乘？（如重庆西 vs 重庆北是不同站）
+自检发现问题时，先重新调工具修正，再回答用户。评审结论用一句话带过，例如："已通过独立评审：换乘等待40分钟合理，余票充足。"
 
 ## 输出规则
 1. 查车次：用 markdown 表格列出所有车次，列：车次、出发站、到达站、出发时间、到达时间、历时、各席别(价格/余票)。表格后标出"🚀 最快"和"💰 最便宜"。
