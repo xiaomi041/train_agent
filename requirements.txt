@@ -1,0 +1,7 @@
+streamlit
+agno
+fastembed
+requests
+certifi
+python-dotenv
+numpy
