@@ -473,8 +473,9 @@ def search_knowledge(query: str, top_k: int = 3) -> str:
 
 # ========== Streamlit 界面 ==========
 import base64
-st.set_page_config(page_title="AI 火车票查询", page_icon="logo.jpg", layout="wide")
-with open("logo.jpg", "rb") as _f:
+_LOGO_PATH = Path(__file__).parent / "logo.jpg"
+st.set_page_config(page_title="AI 火车票查询", page_icon=str(_LOGO_PATH), layout="wide")
+with open(_LOGO_PATH, "rb") as _f:
     _logo_b64 = base64.b64encode(_f.read()).decode()
 st.markdown(
     f'<div style="display:flex;align-items:center;gap:12px">'

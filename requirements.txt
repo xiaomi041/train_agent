@@ -1,5 +1,6 @@
 streamlit
 agno
+openai
 fastembed
 requests
 certifi

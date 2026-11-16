@@ -1,0 +1,21 @@
+# 虚拟环境与缓存
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 版本控制与 IDE
+.git/
+.idea/
+
+# 密钥
+.env
+.env.*
+
+# 运行期缓存（首次运行自动抓取）
+stations.json
+
+# 测试与临时脚本
+test_*.py
+_patch*.py
+*.bat

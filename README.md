@@ -92,6 +92,23 @@ train_agent/
 └── .env                  # API 密钥（已被 git 忽略，请勿上传）
 ```
 
+## 🐳 部署（Docker）
+
+```bash
+docker build -t train-ai .
+docker run -d --name train-ai \
+  -p 8502:8501 \
+  --env-file .env \
+  -v "$(pwd)/cache:/root/.cache" \
+  --restart unless-stopped \
+  train-ai
+```
+
+- 镜像内已安装 `libgomp1`（onnxruntime 依赖），否则 fastembed 导入会失败。
+- `/root/.cache` 挂载可缓存 bge-small-zh 模型，避免每次重启重新下载。
+- `stations.json` 首次运行自动抓取并落盘，不进镜像。
+- 与个人事务项目同时部署时使用根目录的 `docker-compose.yml`；公网访问见 `DEPLOY.md`。
+
 ## ⚠️ 免责声明
 
 本项目的数据来自 12306 官方公开的余票查询接口，仅供**学习研究**使用，请勿用于商业用途；出行信息请以 12306 官方渠道为准。
