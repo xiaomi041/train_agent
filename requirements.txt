@@ -1,8 +1,9 @@
-streamlit
-agno
-openai
-fastembed
-requests
-certifi
-python-dotenv
-numpy
+# 全部锁定到容器内实测通过的版本（2026-11-17）。
+streamlit==1.67.0
+agno==3.2.0
+openai==3.50.0
+fastembed==0.9.1
+requests==2.34.2
+certifi==2026.10.23
+python-dotenv==1.2.4
+numpy==2.5.4
