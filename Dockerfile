@@ -15,8 +15,10 @@ RUN apt-get update \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 只复制运行所需文件；stations.json 首次运行会自动抓取并落盘，不进镜像
-COPY a.py logo.jpg train_knowledge.md ./
+# 复制全部源码：新增模块（ticket_api.py / watch.py）必须一起进镜像，
+# 否则 app 启动后 import 失败而健康检查仍然 200（假的健康）。
+# .dockerignore 已排除 .env / .venv / stations.json / test_*.py。
+COPY . .
 
 EXPOSE 8501
 
