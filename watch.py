@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import sqlite3
 import threading
@@ -25,12 +26,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
+import geo
 import ticket_api
 
 log = logging.getLogger("watch")
 
+# 每轮最多查几个中转枢纽（每个枢纽两次查询，太多会拖慢单轮并增加被限流的风险）
+HUB_QUERY_LIMIT = int(__import__("os").getenv("WATCH_HUB_LIMIT", "3"))
+
 BASE_DIR = Path(__file__).parent
-DB_PATH = BASE_DIR / "watch.db"
+DB_PATH = Path(os.getenv("WATCH_DB", str(BASE_DIR / "watch.db")))
 
 # ---------------------------------------------------------------- 目标
 
@@ -261,8 +266,13 @@ def real_fetcher(goal: Goal, hubs: Optional[list] = None, sleep_between: float =
                     out.extend(_direct_schemes(t, d))
 
     if goal.relax_level >= 1 and goal.allow_transfer and hubs:
+        # 按"是否顺路"挑枢纽，而不是盲取列表前三个：
+        # 北京→上海应该试南京/济南/徐州，而不是天津/石家庄。
+        picked = geo.pick_hubs(goal.origin, goal.dest, hubs, k=HUB_QUERY_LIMIT)
+        if picked:
+            log.info("中转枢纽（按绕行比挑选）：%s", "、".join(picked))
         for d in dates[:1]:
-            for hub in hubs[:3]:
+            for hub in picked:
                 try:
                     out.extend(_transfer_schemes(goal, hub, d, sleep_between))
                 except FetchError:
@@ -339,9 +349,13 @@ def decide(schemes: list, goal: Goal) -> Decision:
     """根据本轮观察决定下一步。这是「自主推进」的落点，也是评测的断言对象。"""
     goal_id = goal.id
     if not schemes:
-        if goal.relax_level < MAX_LEVEL:
-            return Decision("降级", goal.relax_level + 1, "本轮没有任何可买方案", goal_id=goal_id)
-        return Decision("放弃", goal.relax_level, "已放宽到最宽仍无方案", goal_id=goal_id)
+        # 一条都没有 = 现在没票（还没放票 / 已售罄 / 该日期已过）。
+        # 这种情况**不能**判定放弃：昨天没有今天可能有，盯票的价值就在于等。
+        # 前两级仍然要扩搜（放开中转、放开日期弹性），因为"没票"也可能是搜得太窄。
+        if goal.relax_level < 2:
+            return Decision("降级", goal.relax_level + 1, "本轮没有任何可买方案，先扩大搜索范围",
+                            goal_id=goal_id)
+        return Decision("等待", goal.relax_level, "本轮无票（搜索范围已放开），继续盯", goal_id=goal_id)
 
     ordered = rank(schemes, goal)
     best = ordered[0]

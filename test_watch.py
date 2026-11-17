@@ -194,12 +194,12 @@ def test_internal_error_no_fabrication():
 
 # ---------------------------------------------------------------- 7. 全局放弃
 def test_give_up_with_closest():
-    print("\n[8] 逐级放宽到顶仍无解 → 明确放弃，并给出最接近方案")
+    print("\n[8] 有票但怎么放宽都不满足 → 放弃，并给出最接近方案")
     store = Store(Path(":memory:"))
 
     def fetcher(g):
-        if g.relax_level < watch.MAX_LEVEL:
-            return []
+        # 关键：始终"有票"，只是这票永远违反约束（超预算 + 超耗时）。
+        # 这才是该放弃的情形——需求本身不现实。而"一条都没有"是没票，见 [10]。
         return [scheme(price=1500, duration_min=1400, arr_time="23:50")]
 
     g = make_goal()
@@ -242,6 +242,30 @@ def test_path_depends_on_observation():
     ok("两条路径不同（说明在决策而非跑脚本）", l_hit != l_miss, f"{l_hit} vs {l_miss}")
 
 
+
+def test_no_ticket_keeps_waiting():
+    print("\n[10] 持续无票 → 不放弃，扩搜到第 2 级后转为等待")
+    store = Store(Path(":memory:"))
+
+    def fetcher(g):
+        return []   # 没票：还没放票 / 已售罄
+
+    g = make_goal()
+    store.save_goal(g)
+    w = Watcher(g, fetcher, store, sleep=lambda s: None)
+    actions = []
+    for _ in range(6):
+        d = w.tick()
+        actions.append(d.action)
+        if g.status != "active":
+            break
+
+    ok("没有判定放弃", "放弃" not in actions, actions)
+    ok("任务仍在 active", g.status == "active", g.status)
+    ok("扩搜级别停在第 2 级（不再无意义地往上加）", g.relax_level == 2, g.relax_level)
+    ok("后续动作是等待", actions[-1] == "等待", actions)
+
+
 def main():
     tests = [
         test_goal_verifiable,
@@ -253,6 +277,7 @@ def main():
         test_internal_error_no_fabrication,
         test_give_up_with_closest,
         test_path_depends_on_observation,
+        test_no_ticket_keeps_waiting,
     ]
     for t in tests:
         try:

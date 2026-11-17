@@ -6,6 +6,7 @@ AI 火车票查询助手（12306 官方接口版）
 - 界面：Streamlit 聊天式界面
 """
 import os
+import hmac
 import json
 import time
 import requests
@@ -334,6 +335,46 @@ def search_knowledge(query: str, top_k: int = 3) -> str:
 import base64
 _LOGO_PATH = Path(__file__).parent / "logo.jpg"
 st.set_page_config(page_title="AI 火车票查询", page_icon=str(_LOGO_PATH), layout="wide")
+# ========== 访问口令 ==========
+# 这个应用会消耗 DeepSeek 额度，且能看到「盯票任务」里的行程信息。
+# 端口只绑 127.0.0.1 之后局域网就进不来；口令是第二道闸，供内网穿透场景使用。
+def _read_app_password() -> str:
+    try:
+        if "APP_PASSWORD" in st.secrets:
+            return str(st.secrets["APP_PASSWORD"])
+    except Exception:
+        pass
+    return os.getenv("APP_PASSWORD", "").strip()
+
+
+APP_PASSWORD = _read_app_password()
+
+
+def _login_gate() -> bool:
+    """未配置口令时不拦（本地开发）；配置了就必须输对。"""
+    if not APP_PASSWORD:
+        st.session_state.authed = True
+        return True
+    if st.session_state.get("authed"):
+        return True
+
+    st.markdown("### 🔒 需要访问口令")
+    st.caption("这是私人工具（会消耗模型额度、能看到行程），需要口令才能使用。")
+    with st.form("train_login"):
+        pwd = st.text_input("口令", type="password", key="train_pwd")
+        submitted = st.form_submit_button("进入", use_container_width=True)
+    if submitted:
+        if hmac.compare_digest(pwd.strip(), APP_PASSWORD):
+            st.session_state.authed = True
+            st.rerun()
+        else:
+            st.error("口令不正确")
+    return False
+
+
+if not _login_gate():
+    st.stop()
+
 with open(_LOGO_PATH, "rb") as _f:
     _logo_b64 = base64.b64encode(_f.read()).decode()
 st.markdown(
@@ -541,7 +582,7 @@ with st.expander("🧭 多约束规划：预算 / 时段 / 换乘 / 席别一起
     )
     p_strict = st.checkbox("席别必须属于上面的偏好", value=False, key="plan_strict")
     plan_clicked = st.button("🧭 开始规划", key="plan_btn", type="primary", use_container_width=True)
-    st.caption("说明：中转只查你勾选的枢纽（前 3 个，控制请求数）；被排除的方案会给原因，不会悄悄消失。")
+    st.caption("说明：中转枢纽按「是否顺路」（绕行比）自动挑前 3 个，不是盲取列表前三个；被排除的方案会给原因，不会悄悄消失。")
 
 if plan_clicked:
     _d_after, _d_before = _parse_window(p_dep)
@@ -556,10 +597,10 @@ if plan_clicked:
         strict_seat=p_strict,
         allow_transfer=int(p_trans) > 0,
     )
-    _hubs = st.session_state.selected_hubs or ALL_HUBS[:3]
-    with st.spinner(f"正在查询（直达 + {min(len(_hubs), 3)} 个枢纽）..."):
+    _hubs = st.session_state.selected_hubs or ALL_HUBS
+    with st.spinner("正在查询（直达 + 自动挑选的顺路枢纽）..."):
         _res = planner.plan(start.strip(), end.strip(), date.strftime("%Y-%m-%d"),
-                            _cons, hubs=_hubs[:3])
+                            _cons, hubs=_hubs)
     st.markdown(f"### 🧭 规划结果　{_res.head_line()}")
     st.caption("约束：" + "；".join(_cons.describe()))
     if _res.picks_table():
@@ -741,7 +782,6 @@ st.subheader("🎯 盯票：让它自己盯着，买到就给出可执行卡片"
 
 if "watch_store" not in st.session_state:
     st.session_state.watch_store = watch.Store()
-    st.session_state.watchers = {}
 _wstore = st.session_state.watch_store
 
 
@@ -804,24 +844,21 @@ if _wgoals:
             if g.note:
                 st.caption(g.note)
 
-            bc1, bc2, bc3 = st.columns([1.1, 1.1, 2])
+            bc1, bc2 = st.columns([1.2, 3.8])
             if g.status == "active" and bc1.button("立即检查一次", key=f"tick_{g.id}"):
                 with st.spinner("查一次 12306..."):
                     d = watch.Watcher(g, fetcher=_watch_fetcher, store=_wstore, notifier=notify.send).tick()
                 st.info(d.summary())
                 st.rerun()
-            if g.status == "active" and bc2.button("停止", key=f"stop_{g.id}"):
+            if g.status == "active" and bc2.button("停止这个任务", key=f"stop_{g.id}"):
                 g.status = "stopped"
                 _wstore.save_goal(g)
                 st.rerun()
-            if g.status == "active" and bc3.button("后台持续盯（每 %d 秒）" % g.interval_sec,
-                                                   key=f"run_{g.id}"):
-                w = st.session_state.watchers.get(g.id)
-                if w is None:
-                    w = watch.Watcher(g, fetcher=_watch_fetcher, store=_wstore, notifier=notify.send)
-                    st.session_state.watchers[g.id] = w
-                w.start()
-                st.success("已在后台开始轮询；命中或放弃后自动停止。")
+            if g.status == "active":
+                # 常驻轮询已经交给 watch-worker 进程（关掉网页也在盯），
+                # 这里不再提供"在本页开线程"的按钮 —— 那会造成两个轮询器重复查接口。
+                st.caption(f"🛰 后台常驻进程每 {g.interval_sec} 秒检查一次（没票时自动退避到最多 4 倍间隔），"
+                           "关掉本页也会继续；命中后通过提醒服务通知你。")
 
             with st.expander(f"决策记录（最近 {min(len(_wstore.events(g.id, 50)), 50)} 条）"):
                 rows = _wstore.events(g.id, 50)
@@ -861,6 +898,12 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
 # 侧边栏清空
 if st.session_state.messages:
     if st.sidebar.button("🗑️ 清空对话"):
+        st.session_state.messages = []
+        st.rerun()
+
+if APP_PASSWORD and st.session_state.get("authed"):
+    if st.sidebar.button("🔓 退出登录"):
+        st.session_state.pop("authed", None)
         st.session_state.messages = []
         st.rerun()
 
