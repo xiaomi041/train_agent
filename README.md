@@ -84,13 +84,51 @@ streamlit run a.py
 
 ```
 train_agent/
-├── a.py                  # 主程序（12306 查询 / 图搜索 / Multi-Agent / RAG / 界面）
+├── a.py                  # 主程序（Streamlit 界面 / 图搜索 / Multi-Agent / RAG）
+├── ticket_api.py         # 12306 访问层（会话、站点映射、余票查询）— 与 UI 解耦，可被复用和离线测试
+├── watch.py              # 盯票 Agent（目标约束集 / 轮询决策 / 逐级降级 / 事件留痕）
+├── test_watch.py         # 盯票 Agent 的离线测试（33 条断言，不联网不调模型）
 ├── train_knowledge.md    # 乘车规则知识库（可自行扩充，启动时自动向量化）
 ├── stations.json         # 12306 站点缓存（首次运行自动生成，已被 git 忽略）
 ├── logo.jpg              # 页面图标
 ├── requirements.txt      # 依赖清单
 └── .env                  # API 密钥（已被 git 忽略，请勿上传）
 ```
+
+## 🎯 盯票 Agent（常驻模式）
+
+原来的用法是「问一句、查一次、给个结果」。任务单薄的地方在于：**买票的难点不是查一次，而是盯到有票为止**。
+`watch.py` 把它变成一个有状态、会降级、会放弃的常驻任务：
+
+```python
+from watch import Goal, Watcher, Store
+
+goal = Goal(origin="十堰", dest="哈尔滨", date="2026-11-20",
+            budget=500, max_minutes=840, arrive_before="22:00",
+            seat_prefs=["硬卧", "二等座"], interval_sec=300)
+store = Store()
+store.save_goal(goal)
+Watcher(goal, fetcher=real_fetcher, store=store).start()   # 后台轮询
+```
+
+三条判据都有代码落点（也是 `test_watch.py` 的断言对象）：
+
+| 判据 | 落点 | 失败会怎样 |
+|---|---|---|
+| 目标可验证 | `Goal` 是约束集，`check(scheme, goal)` 返回违规项 | 不会被"看起来差不多"的方案骗过去 |
+| 多步自主推进 | `decide()` 按本轮观察决定：命中 / 降级 / 等待 / 放弃 | 路径随余票变化，不是固定流水线 |
+| 失败自恢复 | `tick()` 区分四类失败 | 暂时性→退避重试；数据缺失→换查法；目标不可达→逐级放宽；内部错误→兜底不编造 |
+
+逐级放宽的顺序（`relax_level` 0→4）：允许中转 → 日期前后浮动 → 席别不限 → 预算 +20% / 到达时段放宽。
+每一级都会留下事件记录（`watch.db` 的 `events` 表），界面上可以逐条看它"为什么这么判"。
+
+离线跑测试：
+
+```bash
+python test_watch.py      # 33 条断言，秒级完成
+python watch.py demo      # 看一遍「无票 → 降级 → 命中」的完整决策链
+```
+
 
 ## 🐳 部署（Docker）
 

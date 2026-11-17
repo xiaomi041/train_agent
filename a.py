@@ -15,6 +15,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import streamlit as st
 from agno.agent import Agent
+import watch
 from agno.models.deepseek import DeepSeek
 
 # ========== 配置 ==========
@@ -23,90 +24,18 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 SKIP_SSL = os.getenv("SKIP_SSL_VERIFY", "0") == "1"
 VERIFY = False if SKIP_SSL else certifi.where()
 
-STATION_CACHE = Path(__file__).parent / "stations.json"
 KNOWLEDGE_FILE = Path(__file__).parent / "train_knowledge.md"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# 12306 席别代码 → 名称
-SEAT_CODE_MAP = {
-    "9": "商务座", "P": "特等座", "M": "一等座", "O": "二等座",
-    "W": "软卧", "4": "软卧", "3": "硬卧", "1": "硬座",
-    "A": "高级软卧", "F": "动卧", "C": "软座",
-}
-
-REMAIN_INDEX = {
-    "商务座": 29, "一等座": 30, "二等座": 31,
-    "软卧": 28, "硬卧": 26, "硬座": 24, "无座": 23,
-}
-
-
-def parse_prices(seat_types: str, price_str: str) -> dict:
-    prices = {}
-    if not price_str:
-        return prices
-    for i, code in enumerate(seat_types):
-        start, end = i * 10, i * 10 + 10
-        if end > len(price_str):
-            break
-        digits = price_str[start + 1:end]
-        try:
-            prices[SEAT_CODE_MAP.get(code, code)] = int(digits[:5]) / 10.0
-        except (ValueError, IndexError):
-            continue
-    return prices
-
-
-# ========== 12306 会话与站点映射（全局单例，避免重复握手触发反爬） ==========
-_session = None
-_station_map = None
-
-
-def get_session(force_refresh: bool = False) -> requests.Session:
-    global _session
-    if _session is None or force_refresh:
-        _session = requests.Session()
-        _session.headers.update(HEADERS)
-        try:
-            _session.get("https://kyfw.12306.cn/otn/leftTicket/init",
-                         timeout=15, verify=VERIFY)
-        except Exception:
-            pass
-    return _session
-
-
-def get_station_map() -> dict:
-    global _station_map
-    if _station_map is not None:
-        return _station_map
-    if STATION_CACHE.exists():
-        _station_map = json.loads(STATION_CACHE.read_text(encoding="utf-8"))
-        return _station_map
-    s = get_session()
-    r = s.get(
-        "https://kyfw.12306.cn/otn/resources/js/framework/station_name.js",
-        timeout=15, verify=VERIFY,
-    )
-    mapping = {}
-    for chunk in r.text.split("@"):
-        parts = chunk.split("|")
-        if len(parts) >= 3:
-            name, code = parts[1], parts[2]
-            if name and code:
-                mapping[name] = code
-    STATION_CACHE.write_text(json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
-    _station_map = mapping
-    return mapping
-
-
-def get_city_stations(name: str) -> list:
-    """输入城市名，返回该城市所有火车站（前缀匹配，含主站+东南西北等站）。"""
-    station_map = get_station_map()
-    name = name.strip()
-    matched = [s for s in station_map.keys() if s.startswith(name)]
-    return matched if matched else [name]
+# ========== 12306 访问层：实现见 ticket_api.py（单独模块，便于复用与离线测试） ==========
+from ticket_api import (  # noqa: E402
+    HEADERS, REMAIN_INDEX, SEAT_CODE_MAP,
+    get_city_stations, get_session, get_station_map,
+    parse_prices, query_ticket_dict, query_train_ticket,
+)
 
 
 # ========== 工具：获取今天日期（解决"今天/明天"相对时间问题） ==========
@@ -122,78 +51,6 @@ def get_today() -> str:
 
 
 # ========== 工具：查询站到站余票 ==========
-def query_train_ticket(start_station: str, end_station: str, travel_date: str) -> str:
-    """查询站到站火车票余票和票价。session失效时自动重试一次。"""
-    station_map = get_station_map()
-    from_code = station_map.get(start_station.strip())
-    to_code = station_map.get(end_station.strip())
-
-    if not from_code:
-        return json.dumps({"error": f"找不到出发站「{start_station}」"}, ensure_ascii=False)
-    if not to_code:
-        return json.dumps({"error": f"找不到到达站「{end_station}」"}, ensure_ascii=False)
-
-    for attempt in range(2):
-        s = get_session(force_refresh=(attempt == 1))
-        try:
-            r = s.get(
-                "https://kyfw.12306.cn/otn/leftTicket/query",
-                params={
-                    "leftTicketDTO.train_date": travel_date,
-                    "leftTicketDTO.from_station": from_code,
-                    "leftTicketDTO.to_station": to_code,
-                    "purpose_codes": "ADULT",
-                },
-                timeout=15, verify=VERIFY,
-            )
-            data = r.json()
-        except Exception as e:
-            if attempt == 0:
-                continue
-            return json.dumps({"error": f"网络请求异常：{e}"}, ensure_ascii=False)
-
-        if not data.get("status"):
-            if attempt == 0:
-                time.sleep(0.5)
-                continue
-            return json.dumps({"error": f"查询失败：{data.get('messages', '未知错误')}"},
-                              ensure_ascii=False)
-
-        results = data["data"]["result"]
-        name_map = data["data"]["map"]
-
-        # 空结果也可能是限流，重试一次
-        if not results and attempt == 0:
-            time.sleep(0.5)
-            continue
-
-        trains = []
-        for row in results:
-            f = row.split("|")
-            seats = {}
-            for seat_name, idx in REMAIN_INDEX.items():
-                remain = f[idx].strip() if idx < len(f) else ""
-                if remain:
-                    seats[seat_name] = {"remain": remain}
-            prices = parse_prices(f[35], f[39])
-            for seat_name, price in prices.items():
-                seats.setdefault(seat_name, {})["price"] = price
-
-            trains.append({
-                "train_no": f[3],
-                "departure_station": name_map.get(f[6], f[6]),
-                "arrival_station": name_map.get(f[7], f[7]),
-                "departure_time": f[8],
-                "arrival_time": f[9],
-                "duration": f[10],
-                "seats": seats,
-            })
-
-        return json.dumps({"trains": trains}, ensure_ascii=False)
-
-    return json.dumps({"error": "查询失败，请重试"}, ensure_ascii=False)
-
-
 # ========== 工具：中转方案计算 ==========
 def calc_transfer_scheme(train1_json: str, train2_json: str, max_wait_min: int = 720) -> str:
     """枚举所有中转组合，返回最便宜和最快方案。"""
@@ -814,6 +671,101 @@ if auto_search:
     st.session_state.messages.append({"role": "user", "content": f"自动搜索 {start} → {end} {date_str} 的最优路线"})
     st.session_state.messages.append({"role": "assistant", "content": best_text})
 
+# ========== 🎯 盯票任务：Agent 常驻模式 ==========
+st.divider()
+st.subheader("🎯 盯票：让它自己盯着，买到就给出可执行卡片")
+
+if "watch_store" not in st.session_state:
+    st.session_state.watch_store = watch.Store()
+    st.session_state.watchers = {}
+_wstore = st.session_state.watch_store
+
+
+def _watch_fetcher(goal):
+    hubs = st.session_state.get("selected_hubs") or ALL_HUBS
+    return watch.real_fetcher(goal, hubs=hubs)
+
+
+with st.expander("➕ 新建盯票任务", expanded=False):
+    with st.form("watch_new"):
+        wc1, wc2, wc3 = st.columns(3)
+        w_from = wc1.text_input("出发", value=start, key="w_from")
+        w_to = wc2.text_input("到达", value=end, key="w_to")
+        w_date = wc3.date_input("出发日期", value=date, key="w_date")
+
+        wc4, wc5, wc6 = st.columns(3)
+        w_budget = wc4.number_input("预算上限（元，0=不限）", 0.0, 5000.0, 500.0, 50.0)
+        w_maxmin = wc5.number_input("总耗时上限（分钟，0=不限）", 0, 4000, 900, 30)
+        w_interval = wc6.number_input("检查间隔（秒）", 60, 3600, 300, 60,
+                                      help="12306 有反爬，建议不低于 180 秒")
+
+        wc7, wc8, wc9 = st.columns(3)
+        w_after = wc7.text_input("到达时段起", "06:00")
+        w_before = wc8.text_input("到达时段止", "23:59")
+        w_seats = wc9.multiselect(
+            "席别偏好（按顺序）",
+            ["二等座", "一等座", "硬卧", "硬座", "软卧", "无座", "商务座"],
+            default=["二等座", "硬卧", "硬座"],
+        )
+        w_transfer = st.checkbox("允许中转（无票时会把中转纳入候选）", value=True)
+        w_submit = st.form_submit_button("开始盯票", type="primary", use_container_width=True)
+
+    if w_submit:
+        goal = watch.Goal(
+            origin=w_from.strip(), dest=w_to.strip(),
+            date=w_date.strftime("%Y-%m-%d"),
+            budget=float(w_budget) or None,
+            max_minutes=int(w_maxmin) or None,
+            arrive_after=w_after.strip() or "00:00",
+            arrive_before=w_before.strip() or "23:59",
+            seat_prefs=w_seats or ["二等座"],
+            allow_transfer=w_transfer,
+            interval_sec=int(w_interval),
+        )
+        _wstore.save_goal(goal)
+        st.success(f"已创建：{goal.origin} → {goal.dest} {goal.date}（任务 {goal.id}）")
+        st.rerun()
+
+_wgoals = _wstore.list_goals()
+if _wgoals:
+    for g in _wgoals:
+        badge = {"active": "🟡 盯票中", "done": "✅ 已命中",
+                 "failed": "❌ 已放弃", "stopped": "⏹ 已停止"}.get(g.status, g.status)
+        with st.container(border=True):
+            st.markdown(
+                f"**{badge}｜{g.origin} → {g.dest} {g.date}**　"
+                f"预算 {int(g.budget) if g.budget else '不限'} 元 · "
+                f"已检查 {g.attempts} 次 · 放宽到第 {g.relax_level} 级"
+            )
+            if g.note:
+                st.caption(g.note)
+
+            bc1, bc2, bc3 = st.columns([1.1, 1.1, 2])
+            if g.status == "active" and bc1.button("立即检查一次", key=f"tick_{g.id}"):
+                with st.spinner("查一次 12306..."):
+                    d = watch.Watcher(g, fetcher=_watch_fetcher, store=_wstore).tick()
+                st.info(d.summary())
+                st.rerun()
+            if g.status == "active" and bc2.button("停止", key=f"stop_{g.id}"):
+                g.status = "stopped"
+                _wstore.save_goal(g)
+                st.rerun()
+            if g.status == "active" and bc3.button("后台持续盯（每 %d 秒）" % g.interval_sec,
+                                                   key=f"run_{g.id}"):
+                w = st.session_state.watchers.get(g.id)
+                if w is None:
+                    w = watch.Watcher(g, fetcher=_watch_fetcher, store=_wstore)
+                    st.session_state.watchers[g.id] = w
+                w.start()
+                st.success("已在后台开始轮询；命中或放弃后自动停止。")
+
+            with st.expander(f"决策记录（最近 {min(len(_wstore.events(g.id, 50)), 50)} 条）"):
+                rows = _wstore.events(g.id, 50)
+                if not rows:
+                    st.caption("还没有记录，点「立即检查一次」试试。")
+                for ts, lvl, act, reason in rows:
+                    st.write(f"`{ts}` 第 {lvl} 级 · **{act}** · {reason}")
+
 # 显示历史消息
 st.divider()
 for msg in st.session_state.messages:
@@ -847,3 +799,4 @@ if st.session_state.messages:
     if st.sidebar.button("🗑️ 清空对话"):
         st.session_state.messages = []
         st.rerun()
+

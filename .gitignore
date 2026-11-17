@@ -15,3 +15,5 @@ stations.json
 
 # 临时文件
 _patch*.py
+watch.db
+*.db
