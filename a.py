@@ -15,6 +15,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 import streamlit as st
 from agno.agent import Agent
+import notify
+import planner
 import watch
 from agno.models.deepseek import DeepSeek
 
@@ -508,6 +510,68 @@ with st.expander("🎛️ 选择中转城市（自动搜索时只搜选中的城
 
     st.caption(f"当前选中 {len(st.session_state.selected_hubs)} / {len(ALL_HUBS)} 个城市")
 
+# ---- 多约束规划（B）：把「最便宜/最快」换成「在约束内可执行」 ----
+def _parse_window(text: str, default=("00:00", "23:59")):
+    """把 "07:00-22:00" 解析成 (after, before)；解析失败回退默认值。"""
+    try:
+        a, b = str(text).replace("—", "-").replace("~", "-").split("-")
+        a, b = a.strip(), b.strip()
+        datetime.strptime(a, "%H:%M")
+        datetime.strptime(b, "%H:%M")
+        return a, b
+    except Exception:
+        return default
+
+
+with st.expander("🧭 多约束规划：预算 / 时段 / 换乘 / 席别一起卡（原来只算最便宜和最快）"):
+    pc1, pc2, pc3 = st.columns(3)
+    p_budget = pc1.number_input("预算上限（元，0=不限）", min_value=0, max_value=5000, value=0, step=50)
+    p_maxh = pc2.number_input("总耗时上限（小时，0=不限）", min_value=0, max_value=48, value=0, step=1)
+    p_trans = pc3.selectbox(
+        "换乘", [0, 1], index=1,
+        format_func=lambda x: "只坐直达" if x == 0 else "最多换 1 次",
+    )
+    pc4, pc5 = st.columns(2)
+    p_dep = pc4.text_input("出发时段（HH:MM-HH:MM）", "00:00-23:59", key="plan_dep")
+    p_arr = pc5.text_input("到达时段（HH:MM-HH:MM）", "00:00-23:59", key="plan_arr")
+    p_seats = st.multiselect(
+        "席别偏好（按顺序）",
+        ["二等座", "一等座", "硬卧", "硬座", "软卧", "无座", "商务座"],
+        default=["二等座", "硬卧", "硬座"], key="plan_seats",
+    )
+    p_strict = st.checkbox("席别必须属于上面的偏好", value=False, key="plan_strict")
+    plan_clicked = st.button("🧭 开始规划", key="plan_btn", type="primary", use_container_width=True)
+    st.caption("说明：中转只查你勾选的枢纽（前 3 个，控制请求数）；被排除的方案会给原因，不会悄悄消失。")
+
+if plan_clicked:
+    _d_after, _d_before = _parse_window(p_dep)
+    _a_after, _a_before = _parse_window(p_arr)
+    _cons = planner.Constraints(
+        budget=float(p_budget) or None,
+        max_minutes=int(p_maxh) * 60 or None,
+        depart_after=_d_after, depart_before=_d_before,
+        arrive_after=_a_after, arrive_before=_a_before,
+        max_transfers=int(p_trans),
+        seat_prefs=p_seats or ["二等座"],
+        strict_seat=p_strict,
+        allow_transfer=int(p_trans) > 0,
+    )
+    _hubs = st.session_state.selected_hubs or ALL_HUBS[:3]
+    with st.spinner(f"正在查询（直达 + {min(len(_hubs), 3)} 个枢纽）..."):
+        _res = planner.plan(start.strip(), end.strip(), date.strftime("%Y-%m-%d"),
+                            _cons, hubs=_hubs[:3])
+    st.markdown(f"### 🧭 规划结果　{_res.head_line()}")
+    st.caption("约束：" + "；".join(_cons.describe()))
+    if _res.picks_table():
+        st.markdown(_res.picks_table())
+    st.markdown("#### 全部可行方案")
+    st.markdown(_res.table())
+    if _res.frontier_text():
+        st.markdown("#### 价格-耗时前沿（再快就得更贵，没有既是它又更好的）")
+        st.markdown(_res.frontier_text())
+    st.markdown("#### 被排除的方案")
+    st.markdown(_res.excluded_text())
+
 # 自动搜索最优路线（直接计算，不经过 AI）
 if auto_search:
     date_str = date.strftime("%Y-%m-%d")
@@ -743,7 +807,7 @@ if _wgoals:
             bc1, bc2, bc3 = st.columns([1.1, 1.1, 2])
             if g.status == "active" and bc1.button("立即检查一次", key=f"tick_{g.id}"):
                 with st.spinner("查一次 12306..."):
-                    d = watch.Watcher(g, fetcher=_watch_fetcher, store=_wstore).tick()
+                    d = watch.Watcher(g, fetcher=_watch_fetcher, store=_wstore, notifier=notify.send).tick()
                 st.info(d.summary())
                 st.rerun()
             if g.status == "active" and bc2.button("停止", key=f"stop_{g.id}"):
@@ -754,7 +818,7 @@ if _wgoals:
                                                    key=f"run_{g.id}"):
                 w = st.session_state.watchers.get(g.id)
                 if w is None:
-                    w = watch.Watcher(g, fetcher=_watch_fetcher, store=_wstore)
+                    w = watch.Watcher(g, fetcher=_watch_fetcher, store=_wstore, notifier=notify.send)
                     st.session_state.watchers[g.id] = w
                 w.start()
                 st.success("已在后台开始轮询；命中或放弃后自动停止。")

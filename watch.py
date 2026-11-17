@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import random
 import sqlite3
 import threading
@@ -25,6 +26,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import ticket_api
+
+log = logging.getLogger("watch")
 
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "watch.db"
@@ -39,6 +42,9 @@ VIOLATION_ARRIVE = "到达时段不合适"
 VIOLATION_NO_SEAT = "没有可买席别"
 VIOLATION_TRANSFER = "不接受中转"
 VIOLATION_DATE = "日期不符"
+VIOLATION_DEPART = "出发时段不合适"
+VIOLATION_SEAT = "席别不在偏好内"
+VIOLATION_TRANSFER_COUNT = "换乘次数超限"
 
 
 @dataclass
@@ -56,6 +62,10 @@ class Goal:
     arrive_before: str = "23:59"               # 到达时段终点
     seat_prefs: list = field(default_factory=lambda: ["二等座", "硬卧", "硬座"])
     allow_transfer: bool = True
+    depart_after: str = "00:00"                # 出发时段起点
+    depart_before: str = "23:59"               # 出发时段终点
+    max_transfers: int = 1                     # 最多换乘几次（0=只要直达）
+    strict_seat: bool = False                  # 席别必须落在 seat_prefs 内
     interval_sec: int = 300
     max_attempts: int = 288                    # 默认 288 次 ≈ 24h @5min
     status: str = "active"                     # active / done / failed / stopped
@@ -183,8 +193,25 @@ def check(scheme: Scheme, goal: Goal) -> list:
         if not (after <= arr <= before):
             bad.append(VIOLATION_ARRIVE)
 
-    if scheme.kind == "中转" and not goal.allow_transfer:
-        bad.append(VIOLATION_TRANSFER)
+    # 出发时段（始终生效：错过末班车这类约束与"放宽"无关）
+    if goal.depart_after != "00:00" or goal.depart_before != "23:59":
+        dep = datetime.strptime(
+            f"{scheme.date} {scheme.dep_time}", "%Y-%m-%d %H:%M"
+        )
+        d_after = dep.replace(hour=int(goal.depart_after[:2]), minute=int(goal.depart_after[3:5]))
+        d_before = dep.replace(hour=int(goal.depart_before[:2]), minute=int(goal.depart_before[3:5]))
+        if not (d_after <= dep <= d_before):
+            bad.append(VIOLATION_DEPART)
+
+    if scheme.kind == "中转":
+        if not goal.allow_transfer:
+            bad.append(VIOLATION_TRANSFER)
+        elif 1 > goal.max_transfers:
+            bad.append(VIOLATION_TRANSFER_COUNT)
+
+    # 席别约束：严格模式下只接受偏好列表内的席别（level>=3 放宽）
+    if goal.strict_seat and level < 3 and scheme.seat not in goal.seat_prefs:
+        bad.append(VIOLATION_SEAT)
 
     return bad
 
@@ -407,7 +434,8 @@ class Watcher:
     """单个任务的后台轮询器。失败分四类处理，见 tick()。"""
 
     def __init__(self, goal: Goal, fetcher: Fetcher, store: Store,
-                 sleep: Callable[[float], None] = time.sleep, jitter: float = 0.2):
+                 sleep: Callable[[float], None] = time.sleep, jitter: float = 0.2,
+                 notifier: Optional[Callable[[str], dict]] = None):
         self.goal = goal
         self.fetcher = fetcher
         self.store = store
@@ -416,6 +444,16 @@ class Watcher:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.last: Optional[Decision] = None
+        # 通知是副产物：注入进来便于测试，也不让通知失败影响决策
+        self.notifier = notifier
+
+    def _notify(self, text: str) -> None:
+        if not self.notifier:
+            return
+        try:
+            self.notifier(text)
+        except Exception as e:  # noqa: BLE001 — 通知失败不改变任何决策
+            log.warning("通知发送失败（已忽略）：%r", e)
 
     # -- 单轮：观察 → 判定 → 决策（可离线测试）
     def tick(self) -> Decision:
@@ -473,9 +511,14 @@ class Watcher:
         if d.action == "命中":
             g.status = "done"
             g.note = d.best.label() if d.best else ""
+            if d.best:
+                self._notify(f"✅ 盯票命中 | {g.origin}→{g.dest} {g.date} | {d.best.label()}"
+                             f"（第 {g.relax_level} 级，检查 {g.attempts} 次）")
         elif d.action == "放弃":
             g.status = "failed"
             g.note = d.reason
+            self._notify(f"⚠️ 盯票放弃 | {g.origin}→{g.dest} {g.date} | {d.reason}"
+                         f"（检查 {g.attempts} 次）")
         elif g.attempts >= g.max_attempts:
             g.status = "failed"
             d = Decision("放弃", g.relax_level, f"达到最大尝试次数 {g.max_attempts}", goal_id=g.id)
