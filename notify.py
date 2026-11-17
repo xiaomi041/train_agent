@@ -106,4 +106,11 @@ def drain(url: str = None) -> dict:
 if __name__ == "__main__":
     import sys
 
-    print(send(" ".join(sys.argv[1:]) or "测试通知：来自 trainAI"))
+    args = sys.argv[1:]
+    if args and args[0] in ("--drain", "-d"):
+        # 提醒服务恢复后补发积压：成功的出队、失败的保留
+        print(drain())
+    elif args and args[0] in ("--pending", "-p"):
+        print({"pending": pending()})
+    else:
+        print(send(" ".join(args) or "测试通知：来自 trainAI"))
