@@ -485,6 +485,26 @@ class Store:
             )
             self._conn.commit()
 
+    def last_scheme(self, goal_id: str) -> dict:
+        """最近一次「命中」事件里记录的方案字段；没有就返回空 dict。
+
+        界面用它重建出票卡片 —— 不重用事件里的 label 字符串，
+        因为 label 是给人看的，链接需要结构化字段。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT snapshot FROM events WHERE goal_id=? AND action='命中' ORDER BY id DESC LIMIT 1",
+                (goal_id,),
+            ).fetchone()
+        if not row or not row[0]:
+            return {}
+        try:
+            data = json.loads(row[0])
+        except Exception:
+            return {}
+        best = data.get("best") if isinstance(data, dict) else None
+        return best if isinstance(best, dict) else {}
+
     def events(self, goal_id: str, limit: int = 50) -> list:
         with self._lock:
             rows = self._conn.execute(
@@ -578,7 +598,14 @@ class Watcher:
             g.status = "done"
             g.note = d.best.label() if d.best else ""
             if d.best:
-                self._notify(f"✅ 盯票命中 | {g.origin}→{g.dest} {g.date} | {d.best.label()}"
+                # 通知里带一条 12306 深链：手机上点开就是该日期该起终点的查询页，
+                # 只剩「预订」一步 —— 这是「半自动」里最安全的一档（不托管登录态与支付）。
+                try:
+                    import booking
+                    tail = booking.one_line(d.best)
+                except Exception:
+                    tail = d.best.label()
+                self._notify(f"✅ 盯票命中 | {g.origin}→{g.dest} {g.date} | {tail}"
                              f"（第 {g.relax_level} 级，检查 {g.attempts} 次）")
         elif d.action == "放弃":
             g.status = "failed"
@@ -590,7 +617,17 @@ class Watcher:
             d = Decision("放弃", g.relax_level, f"达到最大尝试次数 {g.max_attempts}", goal_id=g.id)
 
         self.store.save_goal(g)
-        self.store.log(g.id, d, {"candidates": candidates})
+        snap = {"candidates": candidates}
+        if d.best is not None:
+            b = d.best
+            snap["best"] = {
+                "train_no": b.train_no, "dep_station": b.dep_station,
+                "arr_station": b.arr_station, "dep_time": b.dep_time,
+                "arr_time": b.arr_time, "duration_min": b.duration_min,
+                "price": b.price, "seat": b.seat, "date": b.date,
+                "kind": b.kind, "via": b.via, "transfers": b.transfers,
+            }
+        self.store.log(g.id, d, snap)
         self.last = d
         return d
 

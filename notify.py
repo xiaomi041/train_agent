@@ -19,6 +19,8 @@ from pathlib import Path
 REMIND_URL = os.getenv("REMIND_URL", "http://personal-ai:8600/remind")
 TIMEOUT = float(os.getenv("REMIND_TIMEOUT", "4"))
 QUEUE_FILE = Path(os.getenv("NOTIFY_QUEUE", str(Path(__file__).parent / "notifications.jsonl")))
+WEBHOOK = os.getenv("NOTIFY_WEBHOOK", "").strip()
+WEBHOOK_TIMEOUT = float(os.getenv("NOTIFY_WEBHOOK_TIMEOUT", "5"))
 
 
 def _post(payload: dict, url: str) -> dict:
@@ -42,6 +44,50 @@ def _queue(payload: dict) -> None:
         pass
 
 
+def _webhook_payload(text: str, url: str = "") -> dict:
+    """按域名猜是哪家机器人 —— 三家都是「POST 一个 JSON」，但字段名不一样。"""
+    u = (url or WEBHOOK).lower()
+    if "feishu" in u or "larksuite" in u:
+        return {"msg_type": "text", "content": {"text": text}}
+    if "dingtalk" in u:
+        return {"msgtype": "text", "text": {"content": text}}
+    if "weixin" in u or "wecom" in u or "qyapi" in u:
+        return {"msgtype": "text", "text": {"content": text}}
+    return {"msgtype": "text", "text": {"content": text}}
+
+
+def webhook_push(text: str, url: str = "") -> dict:
+    """推一条到群机器人（飞书 / 钉钉 / 企业微信）。没配置就是 no-op，不算失败。"""
+    target = (url or WEBHOOK).strip()
+    if not target:
+        return {"ok": False, "skipped": True, "reason": "未配置 NOTIFY_WEBHOOK"}
+    if not text.strip():
+        return {"ok": False, "error": "空内容"}
+    import requests
+
+    payload = _webhook_payload(text, target)
+    try:
+        r = requests.post(target, json=payload, timeout=WEBHOOK_TIMEOUT)
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:160]}
+    if r.status_code != 200:
+        return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:120]}"}
+    # 三家成功时都回 errcode/StatusCode 之类的字段，且 200 也可能带错误码
+    try:
+        data = r.json()
+    except Exception:
+        return {"ok": True, "provider": "unknown"}
+    if isinstance(data, dict):
+        code = data.get("code", data.get("errcode", data.get("StatusCode", 0)))
+        try:
+            bad = int(code) not in (0, 200)
+        except Exception:
+            bad = False
+        if bad:
+            return {"ok": False, "error": f"机器人返回 {code}: {str(data)[:120]}"}
+    return {"ok": True, "provider": "webhook"}
+
+
 def send(content: str, at: str = "", repeat: str = "once", url: str = None) -> dict:
     """发一条通知。at 为空表示「马上提醒」（1 分钟后，避免立刻过期）。"""
     if not content.strip():
@@ -63,6 +109,9 @@ def send(content: str, at: str = "", repeat: str = "once", url: str = None) -> d
         _queue(payload)
         res["queued"] = True
         res["target"] = target
+    # 同时推群机器人（配置了才发；失败了不影响提醒服务那条链路）
+    if WEBHOOK:
+        res["webhook"] = webhook_push(content)
     return res
 
 
@@ -112,5 +161,8 @@ if __name__ == "__main__":
         print(drain())
     elif args and args[0] in ("--pending", "-p"):
         print({"pending": pending()})
+    elif args and args[0] == "--push":
+        # 只推群机器人，不写提醒表：用来单独验证 webhook 通不通
+        print(webhook_push(" ".join(args[1:]) or "测试：来自 trainAI 的 webhook 推送"))
     else:
         print(send(" ".join(args) or "测试通知：来自 trainAI"))

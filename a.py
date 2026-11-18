@@ -16,6 +16,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import streamlit as st
 from agno.agent import Agent
+import booking
 import notify
 import planner
 import watch
@@ -848,6 +849,21 @@ if _wgoals:
             )
             if g.note:
                 st.caption(g.note)
+
+            # 命中了就给「出票卡片」：一键直达 12306 查询页 + 可复制的车次信息。
+            # 不做自动下单 —— 托管登录态和支付密码的风险远大于省下的那两次点击。
+            if g.status == "done":
+                snap = _wstore.last_scheme(g.id)
+                if snap:
+                    from types import SimpleNamespace as _NS
+                    card = booking.card_text(_NS(**snap))
+                    link = booking.search_link(snap.get("dep_station", ""),
+                                               snap.get("arr_station", ""),
+                                               snap.get("date", ""))
+                    if link:
+                        st.link_button("🎫 去 12306 预订（只剩点「预订」）", link)
+                    with st.expander("📋 出票信息（可复制发给同伴）"):
+                        st.code(card, language="text")
 
             bc1, bc2 = st.columns([1.2, 3.8])
             if g.status == "active" and bc1.button("立即检查一次", key=f"tick_{g.id}"):
