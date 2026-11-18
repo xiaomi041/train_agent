@@ -45,8 +45,9 @@ def fake_requests(status=200, body=None, raises=None):
     mod = types.ModuleType("requests")
     calls = []
 
-    def post(url, json=None, timeout=None):
-        calls.append({"url": url, "json": json, "timeout": timeout})
+    def post(url, json=None, timeout=None, data=None, headers=None):
+        calls.append({"url": url, "json": json, "timeout": timeout,
+                      "data": data, "headers": headers or {}})
         if raises:
             raise raises
         return FakeResp(status, body)
@@ -123,6 +124,45 @@ def main():
             sys.modules["requests"] = old
 
     notify.WEBHOOK = old_hook
+
+    # ---- ntfy ----
+    old_topic = notify.NTFY_TOPIC
+    old_srv = notify.NTFY_SERVER
+    notify.NTFY_TOPIC = ""
+    ok("没配 ntfy topic 时 skipped", notify.ntfy_push("hi").get("skipped") is True)
+
+    notify.NTFY_TOPIC = "dingpiao-test"
+    mod5 = fake_requests(200, {"id": "abc"})
+    old = with_requests(mod5)
+    try:
+        r = notify.ntfy_push("盯票命中 测试")
+        ok("ntfy 推送成功", r.get("ok") is True and r.get("provider") == "ntfy", str(r))
+        call = mod5.calls[0]
+        ok("ntfy 发到 topic 路径", call["url"].endswith("/dingpiao-test"), call["url"])
+        ok("ntfy 默认走 ntfy.sh", call["url"].startswith("https://ntfy.sh/"), call["url"])
+        ok("ntfy 正文是 UTF-8 字节", isinstance(call["data"], (bytes, bytearray)) and "盯票".encode("utf-8") in call["data"], str(type(call["data"])))
+        ok("ntfy 带 ASCII 标题头", call["headers"]["Title"] == "trainAI", str(call.get("headers")))
+
+        # 自建服务器
+        mod6 = fake_requests(200, {"id": "abc"})
+        sys.modules["requests"] = mod6
+        notify.ntfy_push("hi", server="https://push.example.com")
+        ok("支持自建 ntfy 服务器", mod6.calls[0]["url"].startswith("https://push.example.com/"), mod6.calls[0]["url"])
+
+        mod7 = fake_requests(404, {})
+        sys.modules["requests"] = mod7
+        ok("ntfy 非 200 判失败", notify.ntfy_push("hi").get("ok") is False)
+
+        mod8 = fake_requests(raises=RuntimeError("断网"))
+        sys.modules["requests"] = mod8
+        ok("ntfy 异常不外溢", notify.ntfy_push("hi").get("ok") is False)
+    finally:
+        if old is None:
+            sys.modules.pop("requests", None)
+        else:
+            sys.modules["requests"] = old
+    notify.NTFY_TOPIC = old_topic
+    notify.NTFY_SERVER = old_srv
 
     # ---- 出票卡片 ----
     class S:

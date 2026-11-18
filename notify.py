@@ -21,6 +21,10 @@ TIMEOUT = float(os.getenv("REMIND_TIMEOUT", "4"))
 QUEUE_FILE = Path(os.getenv("NOTIFY_QUEUE", str(Path(__file__).parent / "notifications.jsonl")))
 WEBHOOK = os.getenv("NOTIFY_WEBHOOK", "").strip()
 WEBHOOK_TIMEOUT = float(os.getenv("NOTIFY_WEBHOOK_TIMEOUT", "5"))
+# ntfy：不依赖任何管理员审批的推送通道（手机装个 App 订阅 topic 即可）
+NTFY_TOPIC = os.getenv("NOTIFY_NTFY", "").strip()
+NTFY_SERVER = os.getenv("NOTIFY_NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+NTFY_TIMEOUT = float(os.getenv("NOTIFY_NTFY_TIMEOUT", "5"))
 
 
 def _post(payload: dict, url: str) -> dict:
@@ -88,6 +92,35 @@ def webhook_push(text: str, url: str = "") -> dict:
     return {"ok": True, "provider": "webhook"}
 
 
+def ntfy_push(text: str, topic: str = "", server: str = "") -> dict:
+    """推一条到 ntfy。没配 topic 就是 no-op。
+
+    ntfy 的协议很朴素：往 `https://ntfy.sh/<topic>` POST 一段纯文本就是一条消息，
+    标题走 ASCII 头（HTTP 头不能放中文），正文是 UTF-8 的 body。
+    """
+    t = (topic or NTFY_TOPIC).strip()
+    if not t:
+        return {"ok": False, "skipped": True, "reason": "未配置 NOTIFY_NTFY"}
+    if not text.strip():
+        return {"ok": False, "error": "空内容"}
+    import requests
+
+    base = (server or NTFY_SERVER).rstrip("/")
+    url = f"{base}/{t}"
+    try:
+        r = requests.post(
+            url,
+            data=text.encode("utf-8"),
+            headers={"Title": "trainAI", "Tags": "train", "Priority": "default"},
+            timeout=NTFY_TIMEOUT,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:160]}
+    if r.status_code != 200:
+        return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:120]}"}
+    return {"ok": True, "provider": "ntfy"}
+
+
 def send(content: str, at: str = "", repeat: str = "once", url: str = None) -> dict:
     """发一条通知。at 为空表示「马上提醒」（1 分钟后，避免立刻过期）。"""
     if not content.strip():
@@ -109,9 +142,11 @@ def send(content: str, at: str = "", repeat: str = "once", url: str = None) -> d
         _queue(payload)
         res["queued"] = True
         res["target"] = target
-    # 同时推群机器人（配置了才发；失败了不影响提醒服务那条链路）
+    # 同时推群机器人 / ntfy（配置了才发；失败了不影响提醒服务那条链路）
     if WEBHOOK:
         res["webhook"] = webhook_push(content)
+    if NTFY_TOPIC:
+        res["ntfy"] = ntfy_push(content)
     return res
 
 
@@ -164,5 +199,8 @@ if __name__ == "__main__":
     elif args and args[0] == "--push":
         # 只推群机器人，不写提醒表：用来单独验证 webhook 通不通
         print(webhook_push(" ".join(args[1:]) or "测试：来自 trainAI 的 webhook 推送"))
+    elif args and args[0] == "--ntfy":
+        # 只推 ntfy：用来单独验证手机能不能收到
+        print(ntfy_push(" ".join(args[1:]) or "测试：来自 trainAI 的 ntfy 推送"))
     else:
         print(send(" ".join(args) or "测试通知：来自 trainAI"))

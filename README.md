@@ -228,6 +228,31 @@ docker compose exec -T train-ai python notify.py --push "测试：来自 trainAI
 > 注意：钉钉机器人默认有「自定义关键词」安全设置，消息里必须包含你设的关键词，
 > 否则会返回 `310000`。我们的消息里固定有「盯票命中」，如果你的关键词不是这个，改一下关键词即可。
 
+### ntfy：不需要任何审批的推送
+
+飞书/钉钉的「自定义机器人」在部分账号（个人版、或组织关闭了该能力）里根本没有入口——
+表现为「添加机器人」页搜索「自定义」返回空。这时候用 ntfy 最省事：
+
+1. 手机装 **ntfy**（App Store / 应用商店搜 `ntfy`）
+2. App 里 `+` → 订阅 topic，起一个别人猜不到的，如 `dingpiao-cjh-8f3k2`
+3. `trainAI/.env` 填一行：
+
+```bash
+NOTIFY_NTFY=dingpiao-cjh-8f3k2
+```
+
+4. 重建容器并按需验证：
+
+```powershell
+docker compose up -d --force-recreate train-ai watch-worker
+docker compose exec -T train-ai python notify.py --ntfy "测试：来自 trainAI"
+```
+
+- 默认走公共服务器 `https://ntfy.sh`，自建就加 `NOTIFY_NTFY_SERVER=https://push.example.com`
+- 标题走 ASCII 头（HTTP 头不能放中文），正文是 UTF-8，中文没问题
+- 浏览器打开 `https://ntfy.sh/<topic>` 也能直接看到消息，方便调试
+- 和 webhook **可以同时开**，两条通道互不影响
+
 ### 双通道
 
 配置了 webhook 就是**两条腿走路**：提醒表（打开页面能看到弹窗）+ 群消息（手机秒到）。
