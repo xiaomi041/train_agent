@@ -352,9 +352,14 @@ APP_PASSWORD = _read_app_password()
 
 
 def _login_gate() -> bool:
-    """未配置口令时不拦（本地开发）；配置了就必须输对。"""
+    """未配置口令时不拦（本地开发）；配置了就必须输对。
+
+    登录时顺带填一个名字：多个使用者共用一个口令时，靠它把各自的盯票任务与
+    订票记录隔开（数据库里有 `owner` 列）。留空就是 `default`，和以前一样。
+    """
     if not APP_PASSWORD:
         st.session_state.authed = True
+        st.session_state.setdefault("owner", "default")
         return True
     if st.session_state.get("authed"):
         return True
@@ -363,14 +368,25 @@ def _login_gate() -> bool:
     st.caption("这是私人工具（会消耗模型额度、能看到行程），需要口令才能使用。")
     with st.form("train_login"):
         pwd = st.text_input("口令", type="password", key="train_pwd")
+        who = st.text_input("你的名字（区分各人的盯票任务，可留空）", key="train_who")
         submitted = st.form_submit_button("进入", use_container_width=True)
     if submitted:
         if hmac.compare_digest(pwd.strip(), APP_PASSWORD):
             st.session_state.authed = True
+            st.session_state.owner = (who.strip() or "default")[:24]
             st.rerun()
         else:
             st.error("口令不正确")
     return False
+
+
+def _owner() -> str:
+    """当前使用者标识。没登录过（本地无口令）就是 default。"""
+    return str(st.session_state.get("owner") or "default")
+
+
+# 每个人最多同时盯几个任务：每人 5 个 × 20 秒节拍已经很吃接口了
+MAX_ACTIVE_PER_OWNER = int(os.getenv("WATCH_MAX_ACTIVE", "5"))
 
 
 if not _login_gate():
@@ -832,11 +848,17 @@ with st.expander("➕ 新建盯票任务", expanded=False):
             max_transfers=2 if w_transfer else 1,
             interval_sec=int(w_interval),
         )
+        active_n = _wstore.count_active(_owner())
+        if active_n >= MAX_ACTIVE_PER_OWNER:
+            st.error(f"你已经有 {active_n} 个在建的盯票任务（上限 {MAX_ACTIVE_PER_OWNER} 个）。"
+                     "先停掉一个再新建 —— 每个任务都在按间隔查 12306，堆太多只会互相拖慢。")
+            st.stop()
+        goal.owner = _owner()
         _wstore.save_goal(goal)
         st.success(f"已创建：{goal.origin} → {goal.dest} {goal.date}（任务 {goal.id}）")
         st.rerun()
 
-_wgoals = _wstore.list_goals()
+_wgoals = _wstore.list_goals(owner=_owner())
 if _wgoals:
     for g in _wgoals:
         badge = {"active": "🟡 盯票中", "done": "✅ 已命中",
@@ -864,6 +886,10 @@ if _wgoals:
                         st.link_button("🎫 去 12306 预订（只剩点「预订」）", link)
                     with st.expander("📋 出票信息（可复制发给同伴）"):
                         st.code(card, language="text")
+                    if st.button("✅ 我买了这趟（记进订票记录）", key=f"book_{g.id}"):
+                        _wstore.add_booking(_owner(), snap, g.id)
+                        st.success("已记入订票记录，下次规划会把这些当作你的偏好参考。")
+                        st.rerun()
 
             bc1, bc2 = st.columns([1.2, 3.8])
             if g.status == "active" and bc1.button("立即检查一次", key=f"tick_{g.id}"):
@@ -888,6 +914,26 @@ if _wgoals:
                 for ts, lvl, act, reason in rows:
                     st.write(f"`{ts}` 第 {lvl} 级 · **{act}** · {reason}")
 
+# ========== 🎟 订票记录：跨任务的长期记忆 ==========
+_bookings = _wstore.bookings(_owner(), 20)
+_title = f"🎟 我的订票记录（{len(_bookings)} 条，长期保留）" if _bookings else "🎟 我的订票记录（还没有）"
+with st.expander(_title, expanded=False):
+    if not _bookings:
+        st.caption("任务命中后点「✅ 我买了这趟」，就会记在这里；下次规划时模型会参考你最近坐过的班次。")
+    else:
+        st.dataframe(
+            [
+                {
+                    "日期": b["date"], "出发": b["dep_station"], "到达": b["arr_station"],
+                    "车次": b["train_no"], "开点": b["dep_time"], "到点": b["arr_time"],
+                    "席别": b["seat"], "票价": b["price"], "记录时间": (b["created_at"] or "")[:16],
+                }
+                for b in _bookings
+            ],
+            use_container_width=True, hide_index=True,
+        )
+        st.caption("这些记录会作为「你最近坐过什么」提供给模型参考，避免每次从零推荐。")
+
 # 显示历史消息
 st.divider()
 for msg in st.session_state.messages:
@@ -911,7 +957,16 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
             for m in st.session_state.messages[:-1]:
                 history_text += f"用户：{m['content']}\n" if m["role"] == "user" else f"助手：{m['content']}\n"
             last_q = st.session_state.messages[-1]["content"]
-            full_prompt = f"之前的对话：\n{history_text}\n用户现在问：{last_q}" if history_text else last_q
+            # 订票记录 = 跨会话的长期记忆：模型不需要知道全部历史，
+            # 只需要知道"这人最近坐过什么"，就能延续偏好（常坐的时段、席别、路线）。
+            _mem = _wstore.recent_context(_owner(), 3)
+            _parts = []
+            if _mem:
+                _parts.append(f"你以前的订票记录（供参考，不必复述）：\n{_mem}")
+            if history_text:
+                _parts.append(f"之前的对话：\n{history_text}")
+            _parts.append(f"用户现在问：{last_q}")
+            full_prompt = "\n\n".join(_parts) if len(_parts) > 1 else last_q
             result = agent.run(full_prompt)
             st.markdown(result.content, unsafe_allow_html=True)
             st.session_state.messages.append({"role": "assistant", "content": result.content})

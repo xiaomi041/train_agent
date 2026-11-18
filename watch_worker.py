@@ -26,7 +26,9 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -48,6 +50,13 @@ TICK_SECONDS = float(os.getenv("WATCH_TICK_SECONDS", "20"))
 BACKOFF_MAX = float(os.getenv("WATCH_BACKOFF_MAX", "4"))
 # 单轮最多处理多少个任务：防止任务堆积时一次 tick 打满接口
 MAX_PER_ROUND = int(os.getenv("WATCH_MAX_PER_ROUND", "20"))
+# 一轮里并行查几个任务。每个任务的一次 tick 要发 1~9 个 HTTP 请求（直连/中转/多段），
+# 串行时一个任务就可能吃掉 1 秒以上，30 个任务根本赶不上 20 秒的节拍。
+CONCURRENCY = max(1, int(os.getenv("WATCH_CONCURRENCY", "4")))
+# 每隔多久裁一次事件表（秒）。裁剪本身很快，但没必要每轮都做。
+PRUNE_EVERY = int(os.getenv("WATCH_PRUNE_SECONDS", "1800"))
+PRUNE_KEEP_PER_GOAL = int(os.getenv("WATCH_KEEP_EVENTS", "200"))
+PRUNE_KEEP_DAYS = int(os.getenv("WATCH_KEEP_DAYS", "30"))
 
 # 「等待」意味着"现在没票/暂时失败"，继续按原频率查收益很低
 _CALM_ACTIONS = {"等待"}
@@ -77,6 +86,9 @@ class WatchWorker:
         self.clock = clock
         self._due: dict[str, float] = {}
         self._backoff: dict[str, float] = {}
+        self._lock = threading.Lock()
+        self._last_prune = 0.0
+        self._pool: Optional[ThreadPoolExecutor] = None
         self._stop = False
 
     # ---------- 单轮 ----------
@@ -93,11 +105,42 @@ class WatchWorker:
         due = [g for g in goals if self._due.get(g.id, 0.0) <= now]
         # 按等待时间排序，保证先建的先查，不会因为任务多而饿死后面的
         due.sort(key=lambda g: self._due.get(g.id, 0.0))
-        for goal in due[:MAX_PER_ROUND]:
-            results.append(self._run_one(goal, now))
+        batch = due[:MAX_PER_ROUND]
         if len(due) > MAX_PER_ROUND:
             log.warning("本轮有 %d 个任务到期，只处理前 %d 个", len(due), MAX_PER_ROUND)
+
+        # 并发执行：每个任务内部仍是串行的 HTTP，但多个任务之间并行。
+        # 数据库有锁、SQLite 开了 WAL，多个线程写事件不会互相阻塞。
+        if CONCURRENCY > 1 and len(batch) > 1:
+            # 复用线程池：每轮新建线程池在 Windows 上要 60 ms 左右，
+            # 而任务少的时候一轮本来就只要几毫秒 —— 建池比干活还贵。
+            if self._pool is None:
+                self._pool = ThreadPoolExecutor(max_workers=CONCURRENCY,
+                                                thread_name_prefix="watch")
+            for brief in self._pool.map(lambda g: self._run_one(g, now), batch):
+                results.append(brief)
+        else:
+            for goal in batch:
+                results.append(self._run_one(goal, now))
+
+        self._maybe_prune()
         return results
+
+    def _maybe_prune(self) -> None:
+        """定期裁剪事件表。长时间盯票时这是唯一会无限增长的表。"""
+        if PRUNE_EVERY <= 0:
+            return
+        now = time.time()
+        if now - self._last_prune < PRUNE_EVERY:
+            return
+        self._last_prune = now
+        try:
+            removed = self.store.prune_events(PRUNE_KEEP_PER_GOAL, PRUNE_KEEP_DAYS)
+            if removed:
+                log.info("裁剪事件表：删除 %d 条，当前 %d 条 / %.1f KB",
+                         removed, self.store.event_count(), self.store.db_bytes() / 1024)
+        except Exception as e:
+            log.warning("裁剪事件表失败（不影响轮询）：%r", e)
 
     def _run_one(self, goal: watch.Goal, now: float) -> dict:
         before_level = goal.relax_level
@@ -105,15 +148,18 @@ class WatchWorker:
             d = watch.Watcher(goal, self.fetcher, self.store, notifier=self.notifier).tick()
         except Exception as e:
             log.warning("任务 %s 执行异常（保留任务，下轮重试）：%r", goal.id, e)
-            self._due[goal.id] = now + _next_interval(goal.interval_sec, self._backoff.get(goal.id, 1.0))
+            with self._lock:
+                self._due[goal.id] = now + _next_interval(
+                    goal.interval_sec, self._backoff.get(goal.id, 1.0))
             return {"id": goal.id, "action": "异常", "reason": repr(e)}
 
         # 有信息量的变化（命中 / 升档）复位退避；纯等待则放大
         informative = d.action in ("命中", "降级", "放弃") or goal.relax_level != before_level
-        factor = 1.0 if informative else min(BACKOFF_MAX, self._backoff.get(goal.id, 1.0) * 1.5)
-        self._backoff[goal.id] = factor
-        interval = _next_interval(goal.interval_sec, factor)
-        self._due[goal.id] = now + interval
+        with self._lock:
+            factor = 1.0 if informative else min(BACKOFF_MAX, self._backoff.get(goal.id, 1.0) * 1.5)
+            self._backoff[goal.id] = factor
+            interval = _next_interval(goal.interval_sec, factor)
+            self._due[goal.id] = now + interval
 
         brief = {
             "id": goal.id,
@@ -124,10 +170,12 @@ class WatchWorker:
         }
         if d.action == "命中":
             log.info("🎯 命中 %s | %s", goal.id, d.summary())
-            self._backoff[goal.id] = 1.0
+            with self._lock:
+                self._backoff[goal.id] = 1.0
         elif d.action == "放弃":
             log.info("⛔ 放弃 %s | %s", goal.id, d.reason)
-            self._due.pop(goal.id, None)
+            with self._lock:
+                self._due.pop(goal.id, None)
         else:
             log.info("⏳ %s | 第 %d 级 | %s | 下次 %ss", goal.id, d.level, d.reason, round(interval))
         return brief
@@ -151,6 +199,9 @@ class WatchWorker:
 
     def stop(self) -> None:
         self._stop = True
+        if self._pool is not None:
+            self._pool.shutdown(wait=False)
+            self._pool = None
 
 
 def main(argv: Optional[list[str]] = None) -> int:
