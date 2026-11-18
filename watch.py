@@ -249,21 +249,30 @@ Fetcher = Callable[[Goal], list]
 
 
 def real_fetcher(goal: Goal, hubs: Optional[list] = None, sleep_between: float = 0.2) -> list:
-    """真实抓取：直达；第 1 级起允许少量枢纽中转（控制请求数）。"""
+    """真实抓取：直达；第 1 级起允许少量枢纽中转（控制请求数）。
+
+    注意：**不要**把城市展开成同城车站逐个查。12306 的余票接口本身把站名归一到城市
+    （查「北京南→上海虹桥」返回的仍是北京/北京丰台/北京南 三个站的全部车次），
+    展开成 9×5=45 个组合会拿到 45 份一模一样的数据：请求数翻 45 倍、耗时翻倍，
+    候选里还全是重复项（实测北京→上海 一次 tick 135 次请求 / 54 秒）。
+    传城市名或站名给接口都对——它自己会归一到城市。
+    """
     out: list = []
     dates = goal.date_window()
-    starts = ticket_api.get_city_stations(goal.origin) if len(goal.origin) <= 3 else [goal.origin]
-    ends = ticket_api.get_city_stations(goal.dest) if len(goal.dest) <= 3 else [goal.dest]
+    seen: set = set()
 
     for d in dates:
-        for s0 in starts:
-            for s1 in ends:
-                data = ticket_api.query_ticket_dict(s0, s1, d)
-                time.sleep(sleep_between)
-                if "error" in data:
-                    raise FetchError(data["error"])
-                for t in data.get("trains", []):
-                    out.extend(_direct_schemes(t, d))
+        data = ticket_api.query_ticket_dict(goal.origin, goal.dest, d)
+        time.sleep(sleep_between)
+        if "error" in data:
+            raise FetchError(data["error"])
+        for t in data.get("trains", []):
+            for s in _direct_schemes(t, d):
+                key = (s.train_no, s.seat, s.date)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(s)
 
     if goal.relax_level >= 1 and goal.allow_transfer and hubs:
         # 按"是否顺路"挑枢纽，而不是盲取列表前三个：
@@ -312,6 +321,7 @@ def _transfer_schemes(goal: Goal, hub: str, d: str, sleep_between: float) -> lis
     if "error" in seg1 or "error" in seg2:
         raise FetchError("中转段查询失败")
     res = []
+    seen: set = set()
     for t1 in seg1.get("trains", []):
         for t2 in seg2.get("trains", []):
             s1 = _direct_schemes(t1, d)
@@ -319,6 +329,10 @@ def _transfer_schemes(goal: Goal, hub: str, d: str, sleep_between: float) -> lis
             if not s1 or not s2:
                 continue
             a, b = s1[0], s2[0]
+            key = (a.train_no, b.train_no, a.seat, b.seat)
+            if key in seen:
+                continue
+            seen.add(key)
             total = a.duration_min + b.duration_min
             if total <= 0:
                 continue

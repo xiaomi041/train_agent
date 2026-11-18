@@ -266,6 +266,53 @@ def test_no_ticket_keeps_waiting():
     ok("后续动作是等待", actions[-1] == "等待", actions)
 
 
+def test_fetcher_no_station_expansion():
+    """real_fetcher 不能把城市展开成同城车站逐个查。
+
+    12306 的余票接口本身把站名归一到城市：查「北京南→上海虹桥」返回的仍是北京三个站
+    的全部车次。扩成 9×5 组合会拿到 45 份完全相同的数据——请求数翻 45 倍、耗时翻倍、
+    候选里全是重复项（修复前一次 tick 135 次请求 / 54 秒）。
+    """
+    import ticket_api
+
+    sent = []
+    orig = ticket_api.query_ticket_dict
+    ticket_api.query_ticket_dict = lambda a, b, d: (
+        sent.append((a, b, d)) or {"trains": [
+            {"train_no": "G1", "departure_station": "北京南", "arrival_station": "上海虹桥",
+             "departure_time": "08:00", "arrival_time": "12:00", "duration": "04:00",
+             "seats": {"二等座": {"remain": "有", "price": 500}}},
+        ]}
+    )
+    try:
+        g = Goal(origin="北京", dest="上海", date="2026-12-01", allow_transfer=False)
+        schemes = watch.real_fetcher(g, hubs=[], sleep_between=0)
+    finally:
+        ticket_api.query_ticket_dict = orig
+
+    ok("单日只发 1 次请求（不展开同城车站）", len(sent) == 1, sent)
+    ok("请求用的是城市名而非站名", sent[0][0] == "北京" and sent[0][1] == "上海", sent[0])
+    ok("返回方案不含重复项", len(schemes) == 1, len(schemes))
+
+
+def test_fetcher_dedupes_same_train(monkeypatch_target=None):
+    """同一车次/席别在多份响应里重复出现时只保留一条。"""
+    import ticket_api
+
+    train = {"train_no": "G2", "departure_station": "北京南", "arrival_station": "上海虹桥",
+             "departure_time": "09:00", "arrival_time": "13:00", "duration": "04:00",
+             "seats": {"二等座": {"remain": "有", "price": 550}}}
+    orig = ticket_api.query_ticket_dict
+    ticket_api.query_ticket_dict = lambda a, b, d: {"trains": [train, dict(train)]}
+    try:
+        g = Goal(origin="北京", dest="上海", date="2026-12-01", allow_transfer=False)
+        schemes = watch.real_fetcher(g, hubs=[], sleep_between=0)
+    finally:
+        ticket_api.query_ticket_dict = orig
+
+    ok("重复车次只留一条", len(schemes) == 1, len(schemes))
+
+
 def main():
     tests = [
         test_goal_verifiable,
@@ -278,6 +325,8 @@ def main():
         test_give_up_with_closest,
         test_path_depends_on_observation,
         test_no_ticket_keeps_waiting,
+        test_fetcher_no_station_expansion,
+        test_fetcher_dedupes_same_train,
     ]
     for t in tests:
         try:
