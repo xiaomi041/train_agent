@@ -33,6 +33,7 @@ log = logging.getLogger("watch")
 
 # 每轮最多查几个中转枢纽（每个枢纽两次查询，太多会拖慢单轮并增加被限流的风险）
 HUB_QUERY_LIMIT = int(__import__("os").getenv("WATCH_HUB_LIMIT", "3"))
+MULTI_HUB_LIMIT = int(__import__("os").getenv("WATCH_MULTI_HUB_LIMIT", "3"))
 
 BASE_DIR = Path(__file__).parent
 DB_PATH = Path(os.getenv("WATCH_DB", str(BASE_DIR / "watch.db")))
@@ -120,8 +121,19 @@ class Scheme:
     date: str
     kind: str = "直达"           # 直达 / 中转
     via: str = ""
+    legs: list = field(default_factory=list)   # 多段中转时逐段的车票（route.Leg）
+
+    @property
+    def transfers(self) -> int:
+        """换乘次数：有 legs 时按段数算，否则看 kind。"""
+        if self.legs:
+            return max(0, len(self.legs) - 1)
+        return 1 if self.kind == "中转" else 0
 
     def label(self) -> str:
+        if self.legs and len(self.legs) > 2:
+            segs = " ｜ ".join(l.label() for l in self.legs)
+            return f"{self.date} {self.dep_time}-{self.arr_time} {self.seat} ¥{self.price:.0f}（换乘 {self.transfers} 次）{segs}"
         base = f"{self.date} {self.train_no} {self.dep_station}→{self.arr_station} {self.dep_time}-{self.arr_time}"
         if self.kind == "中转":
             base += f"（经 {self.via} 中转）"
@@ -208,10 +220,11 @@ def check(scheme: Scheme, goal: Goal) -> list:
         if not (d_after <= dep <= d_before):
             bad.append(VIOLATION_DEPART)
 
-    if scheme.kind == "中转":
+    n_transfer = scheme.transfers
+    if n_transfer > 0:
         if not goal.allow_transfer:
             bad.append(VIOLATION_TRANSFER)
-        elif 1 > goal.max_transfers:
+        elif n_transfer > goal.max_transfers:
             bad.append(VIOLATION_TRANSFER_COUNT)
 
     # 席别约束：严格模式下只接受偏好列表内的席别（level>=3 放宽）
@@ -286,6 +299,31 @@ def real_fetcher(goal: Goal, hubs: Optional[list] = None, sleep_between: float =
                     out.extend(_transfer_schemes(goal, hub, d, sleep_between))
                 except FetchError:
                     continue
+
+    # 两段换乘（A→h1→h2→D）：只有明确允许 2 次换乘、且放宽到第 2 级才试，
+    # 否则请求数会翻几倍，而绝大多数行程一次换乘就够。
+    if goal.relax_level >= 2 and goal.allow_transfer and goal.max_transfers >= 2 and hubs:
+        try:
+            import route as _route
+            picked2 = geo.pick_hubs(goal.origin, goal.dest, hubs, k=MULTI_HUB_LIMIT)
+            if len(picked2) >= 2:
+                log.info("尝试两段换乘，候选枢纽：%s", "、".join(picked2))
+                d = dates[0]
+                fetched = {"n": 0}
+
+                def _fetch(a, b, day, _d=d):
+                    fetched["n"] += 1
+                    data = ticket_api.query_ticket_dict(a, b, day)
+                    if "error" in data:
+                        raise RuntimeError(data["error"])
+                    return data
+
+                for chain in _route.multi_hub_chains(_fetch, goal.origin, goal.dest, picked2, d):
+                    out.append(_route.to_scheme(chain, d))
+                log.info("两段换乘：查了 %d 个区段，得到 %d 条链", fetched["n"], len(out))
+        except Exception as exc:                      # 多段失败不影响直达/单点结果
+            log.warning("两段换乘失败（已忽略）：%r", exc)
+
     return out
 
 

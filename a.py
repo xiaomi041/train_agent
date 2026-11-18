@@ -569,8 +569,9 @@ with st.expander("🧭 多约束规划：预算 / 时段 / 换乘 / 席别一起
     p_budget = pc1.number_input("预算上限（元，0=不限）", min_value=0, max_value=5000, value=0, step=50)
     p_maxh = pc2.number_input("总耗时上限（小时，0=不限）", min_value=0, max_value=48, value=0, step=1)
     p_trans = pc3.selectbox(
-        "换乘", [0, 1], index=1,
-        format_func=lambda x: "只坐直达" if x == 0 else "最多换 1 次",
+        "换乘", [0, 1, 2], index=1,
+        format_func=lambda x: {0: "只坐直达", 1: "最多换 1 次", 2: "最多换 2 次（多段）"}[x],
+        help="换 2 次会走 A→h1→h2→B 的三段组合，请求数明显变多，只在直达和一次换乘都没票时才值得开。",
     )
     pc4, pc5 = st.columns(2)
     p_dep = pc4.text_input("出发时段（HH:MM-HH:MM）", "00:00-23:59", key="plan_dep")
@@ -811,7 +812,10 @@ with st.expander("➕ 新建盯票任务", expanded=False):
             ["二等座", "一等座", "硬卧", "硬座", "软卧", "无座", "商务座"],
             default=["二等座", "硬卧", "硬座"],
         )
-        w_transfer = st.checkbox("允许中转（无票时会把中转纳入候选）", value=True)
+        w_transfer = st.checkbox(
+            "允许中转（无票时会把中转纳入候选；放宽到第 2 级后还会试两段换乘）",
+            value=True,
+        )
         w_submit = st.form_submit_button("开始盯票", type="primary", use_container_width=True)
 
     if w_submit:
@@ -824,6 +828,7 @@ with st.expander("➕ 新建盯票任务", expanded=False):
             arrive_before=w_before.strip() or "23:59",
             seat_prefs=w_seats or ["二等座"],
             allow_transfer=w_transfer,
+            max_transfers=2 if w_transfer else 1,
             interval_sec=int(w_interval),
         )
         _wstore.save_goal(goal)
