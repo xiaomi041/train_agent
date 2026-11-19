@@ -23,6 +23,15 @@ except Exception:  # pragma: no cover
     pass
 VERIFY = False if SKIP_SSL else certifi.where()
 
+if SKIP_SSL:
+    # 12306 的证书链在容器里校验不过（缺中间证书），只能关校验。
+    # 关掉之后 requests 会给**每个请求**打两行 InsecureRequestWarning，
+    # 24 小时盯票就是几万行日志，真正的事件被淹掉。
+    # 这里只关「这条已知的告警」，不是关掉整个 warnings —— 别的警告还要能看见。
+    import urllib3
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"

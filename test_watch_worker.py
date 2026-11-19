@@ -243,6 +243,48 @@ def test_cli_once():
     ok("返回码为 0", code == 0, code)
 
 
+# ---------------------------------------------------------------- 9
+def test_heartbeat_reports_progress():
+    print("\n[9] 心跳：定期把「还在转吗 / 库有没有失控」打进日志")
+    import logging
+
+    store = temp_store()
+    clock = Clock()
+    g = make_goal()
+    store.save_goal(g)
+
+    lines = []
+
+    class Collect(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    logger = logging.getLogger("watch_worker")
+    h = Collect()
+    logger.addHandler(h)
+    logger.setLevel(logging.INFO)
+    try:
+        w = watch_worker.WatchWorker(store=store, fetcher=lambda _g: [],
+                                     notifier=lambda _t: {"ok": True}, clock=clock)
+        w.run_once()
+        beats = [x for x in lines if x.startswith("心跳：")]
+        ok("第一轮就报一次心跳（启动即报）", len(beats) == 1, lines)
+        ok("心跳里有盯票中/事件/库大小",
+           all(k in beats[0] for k in ("盯票中", "事件", "库")), beats[:1])
+
+        clock.t += 10
+        w.run_once()
+        ok("间隔没到不重复报", len([x for x in lines if x.startswith("心跳：")]) == 1)
+
+        clock.t += watch_worker.HEARTBEAT_EVERY
+        w.run_once()
+        beats = [x for x in lines if x.startswith("心跳：")]
+        ok("到间隔后再次报心跳", len(beats) == 2, beats)
+        ok("轮次计数随 run_once 增长", w._rounds >= 3, w._rounds)
+    finally:
+        logger.removeHandler(h)
+
+    store._conn.close()
 def main() -> int:
     tests = [
         test_only_due_goals,
@@ -252,6 +294,7 @@ def main() -> int:
         test_only_active_goals,
         test_notifier_failure_is_swallowed,
         test_drain_runs_on_heartbeat,
+        test_heartbeat_reports_progress,
         test_cli_once,
     ]
     for t in tests:

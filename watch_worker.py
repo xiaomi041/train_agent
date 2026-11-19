@@ -61,6 +61,8 @@ PRUNE_KEEP_DAYS = int(os.getenv("WATCH_KEEP_DAYS", "30"))
 # 补发通知队列的间隔（秒）。通知失败会进 `notifications.jsonl`，但以前只有手动
 # `notify.py --drain` 才会重发 —— 等于没人管。挂在常驻进程的心跳上才对。
 DRAIN_EVERY = int(os.getenv("WATCH_DRAIN_SECONDS", "300"))
+# 心跳间隔（秒）：长周期观察时靠这一行判断"还在转吗、库有没有失控"
+HEARTBEAT_EVERY = int(os.getenv("WATCH_HEARTBEAT_SECONDS", "600"))
 
 # 「等待」意味着"现在没票/暂时失败"，继续按原频率查收益很低
 _CALM_ACTIONS = {"等待"}
@@ -101,6 +103,13 @@ class WatchWorker:
         self._last_drain = 0.0
         self._pool: Optional[ThreadPoolExecutor] = None
         self._stop = False
+        # 长周期观察用：进程自己报数，不必再外挂一个采样脚本。
+        # 机器睡眠/重启后这些计数从 0 重新开始，但任务状态在 SQLite 里，
+        # 所以「断过多久」要靠日志时间戳看，不能靠这里的 uptime。
+        self._started_at = self.clock()
+        self._last_beat = 0.0
+        self._rounds = 0
+        self._ticks = 0
 
     # ---------- 单轮 ----------
     def run_once(self) -> list[dict]:
@@ -128,14 +137,18 @@ class WatchWorker:
             if self._pool is None:
                 self._pool = ThreadPoolExecutor(max_workers=CONCURRENCY,
                                                 thread_name_prefix="watch")
+            self._ticks += len(batch)
             for brief in self._pool.map(lambda g: self._run_one(g, now), batch):
                 results.append(brief)
         else:
+            self._ticks += len(batch)
             for goal in batch:
                 results.append(self._run_one(goal, now))
 
         self._maybe_prune()
         self._maybe_drain()
+        self._rounds += 1
+        self._maybe_beat()
         return results
 
     def _maybe_prune(self) -> None:
@@ -214,6 +227,29 @@ class WatchWorker:
         else:
             log.info("⏳ %s | 第 %d 级 | %s | 下次 %ss", goal.id, d.level, d.reason, round(interval))
         return brief
+
+    def _maybe_beat(self) -> None:
+        """定期打一行「心跳」，作为长周期观察的唯一数据源。
+
+        为什么要把这些数打出来：跑一天之后要回答的问题只有三个——
+        它还在转吗、库有没有失控、退避有没有封顶。这三件事全在日志里，
+        不需要外挂采样进程（外挂进程自己也会被机器睡眠杀掉）。
+        """
+        if HEARTBEAT_EVERY <= 0:
+            return
+        now = self.clock()
+        if self._last_beat and now - self._last_beat < HEARTBEAT_EVERY:
+            return
+        self._last_beat = now
+        try:
+            active = len(self.store.list_goals("active"))
+            log.info(
+                "心跳：运行 %.1f 小时｜轮次 %d｜tick %d 次｜盯票中 %d 个｜事件 %d 条｜库 %.1f KB",
+                (now - self._started_at) / 3600.0, self._rounds, self._ticks,
+                active, self.store.event_count(), self.store.db_bytes() / 1024,
+            )
+        except Exception as e:  # 心跳失败绝不能影响轮询
+            log.warning("心跳统计失败（忽略）：%r", e)
 
     # ---------- 常驻 ----------
     def start(self) -> None:
