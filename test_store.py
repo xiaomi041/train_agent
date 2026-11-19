@@ -121,6 +121,38 @@ def main() -> int:
     st.save_goal(g3)
     ok("停止后活跃数回到 1", st.count_active("alice") == 1)
 
+    print("8. 反馈与使用统计（真实使用的度量）")
+    base_all = st.stats(days=7)["goals"]
+    base_alice = st.stats(days=7, owner="alice")["goals"]
+    hit = watch.Goal(origin="北京", dest="上海", date="2026-12-05", id="hit1",
+                     owner="alice", status="done", attempts=6)
+    hit.relax_dims = ["transfer", "money"]
+    st.save_goal(hit)
+    gone = watch.Goal(origin="北京", dest="广州", date="2026-12-06", id="fail1",
+                      owner="bob", status="failed", attempts=8)
+    st.save_goal(gone)
+    st.feedback("hit1", "wrong", "时间太早")
+    st.feedback("hit1", "good")
+
+    s = st.stats(days=7)
+    ok("统计里多了 2 个任务", s["goals"] == base_all + 2, extra=f"got {s['goals']}")
+    ok("状态分布正确（1 done / 1 failed）",
+       s["status"].get("done") == 1 and s["status"].get("failed") == 1, extra=str(s["status"]))
+    ok("检查次数累计 14", s["checks"] == 14, extra=str(s["checks"]))
+    ok("命中率 = 1/(1+1)", abs(s["hit_rate"] - 0.5) < 1e-9, extra=str(s["hit_rate"]))
+    ok("平均命中轮数 6", abs(s["avg_ticks_to_hit"] - 6) < 1e-9)
+    ok("命中时平均放宽 2 项", abs(s["avg_dims_at_hit"] - 2) < 1e-9)
+    ok("误报 1 / 满意 1", s["wrong"] == 1 and s["good"] == 1, extra=f"{s['wrong']}/{s['good']}")
+    ok("使用者 2 人", s["owners"] == 2, extra=str(s["owners"]))
+
+    sa = st.stats(days=7, owner="alice")
+    ok("按人过滤后只多 1 个任务", sa["goals"] == base_alice + 1, extra=str(sa["goals"]))
+    ok("按人过滤后误报仍是 1", sa["wrong"] == 1)
+
+    print("9. 反馈会落进事件表（能被决策记录看到）")
+    acts = [r[2] for r in st.events("hit1", 50)]
+    ok("事件表里出现「反馈」", "反馈" in acts, extra=str(acts[:5]))
+
     shutil.rmtree(TMP, ignore_errors=True)
     print("=" * 60)
     print(f"结果：{passed} 通过，{failed} 失败")

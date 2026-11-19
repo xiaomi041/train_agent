@@ -767,6 +767,78 @@ class Store:
             parts.append(f"{when} {r['dep_station']}→{r['arr_station']} {r['train_no']} {r['seat']}")
         return "；".join(parts)
 
+    # ---------- 真实使用的度量 ----------
+
+    def feedback(self, goal_id: str, verdict: str = "wrong", note: str = "") -> None:
+        """用户对一次命中的评价：wrong（不是我要的）/ good（就是要这趟）。
+
+        写进 events 表而不是新表：它本来就是"这条任务上发生过的事"，
+        且能被 prune_events 一起裁剪、被「决策记录」一起展示。
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO events (goal_id, ts, level, action, reason, snapshot) "
+                "VALUES (?,?,?,?,?,?)",
+                (goal_id, datetime.now().isoformat(timespec="seconds"), None,
+                 "反馈", verdict, note or ""),
+            )
+            self._conn.commit()
+
+    def stats(self, days: int = 7, owner: Optional[str] = None) -> dict:
+        """这段时间里到底发生了什么——给「真的有人用」准备的数字。
+
+        只数事实，不算奖励分：任务数、检查次数、命中/放弃、命中时放宽了几项、
+        平均多少轮才命中、被标成误报几次、订了几张票。
+        """
+        since = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+        where = "created_at >= ?"
+        args: list = [since]
+        if owner:
+            where += " AND owner = ?"
+            args.append(owner)
+
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT spec, status, attempts, relax_level FROM goals WHERE {where}", args
+            ).fetchall()
+            fb = self._conn.execute(
+                "SELECT reason, COUNT(*) FROM events WHERE action='反馈' AND ts >= ? "
+                + ("AND goal_id IN (SELECT id FROM goals WHERE owner=? )" if owner else "")
+                + " GROUP BY reason",
+                ([since, owner] if owner else [since]),
+            ).fetchall()
+            ev = self._conn.execute(
+                "SELECT COUNT(*) FROM events WHERE ts >= ?", (since,)
+            ).fetchone()[0]
+            bk = self._conn.execute(
+                "SELECT COUNT(*) FROM bookings WHERE created_at >= ?"
+                + (" AND owner=?" if owner else ""),
+                ([since, owner] if owner else [since]),
+            ).fetchone()[0]
+
+        goals = [Goal.from_json(s) for s, *_ in rows]
+        status = {"active": 0, "done": 0, "failed": 0, "stopped": 0}
+        for g in goals:
+            status[g.status] = status.get(g.status, 0) + 1
+
+        done = [g for g in goals if g.status == "done"]
+        finished = len(done) + status.get("failed", 0)
+        fb_map = {k: v for k, v in fb}
+        return {
+            "days": days,
+            "goals": len(goals),
+            "status": status,
+            "checks": sum(g.attempts for g in goals),
+            "events": ev,
+            "hit_rate": (len(done) / finished) if finished else 0.0,
+            "avg_ticks_to_hit": (sum(g.attempts for g in done) / len(done)) if done else 0.0,
+            "avg_dims_at_hit": (sum(len(relax_dims(g)) for g in done) / len(done)) if done else 0.0,
+            "wrong": fb_map.get("wrong", 0),
+            "good": fb_map.get("good", 0),
+            "bookings": bk,
+            "owners": len({g.owner for g in goals}),
+        }
+
 
 # ---------------------------------------------------------------- 轮询
 

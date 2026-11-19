@@ -860,6 +860,30 @@ with st.expander("➕ 新建盯票任务", expanded=False):
         st.rerun()
 
 _wgoals = _wstore.list_goals(owner=_owner())
+
+# ========== 📊 使用统计：这些数字才是"真的有人用"的证据 ==========
+with st.expander("📊 使用统计（最近 7 天，本机所有使用者）"):
+    _st = _wstore.stats(days=7)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("任务数", _st["goals"])
+    c2.metric("检查次数", _st["checks"])
+    c3.metric("命中率", f"{_st['hit_rate']:.0%}")
+    c4.metric("误报", _st["wrong"])
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("平均命中轮数", f"{_st['avg_ticks_to_hit']:.1f}")
+    c2.metric("命中时平均放宽项", f"{_st['avg_dims_at_hit']:.1f}")
+    c3.metric("订票记录", _st["bookings"])
+    c4.metric("使用者", _st["owners"])
+    _s = _st["status"]
+    st.caption(
+        f"状态分布：盯票中 {_s.get('active', 0)} · 已命中 {_s.get('done', 0)} · "
+        f"已放弃 {_s.get('failed', 0)} · 已停止 {_s.get('stopped', 0)}"
+    )
+    st.caption(
+        "「误报」= 任务命中后你点了「🙅 不是我要的」。这个数字比命中率更能说明阈值与约束是否合理："
+        "命中率高但误报多，说明约束写得太松；误报少而放弃多，说明约束写得太紧。"
+    )
+
 if _wgoals:
     for g in _wgoals:
         badge = {"active": "🟡 盯票中", "done": "✅ 已命中",
@@ -890,6 +914,15 @@ if _wgoals:
                     if st.button("✅ 我买了这趟（记进订票记录）", key=f"book_{g.id}"):
                         _wstore.add_booking(_owner(), snap, g.id)
                         st.success("已记入订票记录，下次规划会把这些当作你的偏好参考。")
+                        st.rerun()
+                    fb1, fb2 = st.columns(2)
+                    if fb1.button("👍 就是这趟", key=f"good_{g.id}"):
+                        _wstore.feedback(g.id, "good")
+                        st.success("记下了。这组约束是你想要的，统计里算成功命中。")
+                        st.rerun()
+                    if fb2.button("🙅 不是我要的", key=f"wrong_{g.id}"):
+                        _wstore.feedback(g.id, "wrong")
+                        st.warning("记下了。这次命中算误报——调整约束（预算/时段/席别）重新建一个会更准。")
                         st.rerun()
 
             bc1, bc2 = st.columns([1.2, 3.8])

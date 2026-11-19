@@ -12,6 +12,11 @@ import notify  # noqa: E402
 import planner  # noqa: E402
 import watch  # noqa: E402
 
+# 去重是为了防止「页面点一次 + worker 轮一次」重复推送，属于生产行为；
+# 单测里必须关掉，否则上一次跑留下的 notify_sent.jsonl 会让这次的"连接失败"用例被当成重复而跳过。
+notify.DEDUPE_SECONDS = 0
+notify._sent_file().unlink(missing_ok=True)
+
 PASS, FAIL = 0, 0
 
 
