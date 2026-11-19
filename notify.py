@@ -1,13 +1,13 @@
-"""统一通知出口：盯票命中时把结果推到「个人事务委托系统」的提醒服务。
+"""统一通知出口：盯票命中时把结果推到手机（ntfy / 群机器人），可选投给提醒服务。
 
-为什么不让两个项目各写各的通知：
-- 提醒的**落库、去重、弹窗、确认**在 PersonalAI 里已经做好了（`reminders` 表 + 8600 服务）；
-- 再实现一遍只会出现"两个地方都能提醒，但哪个都不准"。
+默认**只走 ntfy**，不依赖任何别的项目。以前默认投给 PersonalAI 的提醒服务，两个项目
+就绑在一起了：它重启的几秒里通知投不进去，它界面上的问题也会牵连过来。现在
+`REMIND_URL` 留空即完全不走提醒服务，要联动时显式配一行即可。
 
 设计要点：
 1. 失败不抛异常：通知是副产物，不能因为它挂了把盯票主流程带崩；
 2. 失败进本地队列（`notifications.jsonl`），下次 `drain()` 补发，进程重启也不丢；
-3. 目标是容器网络里的 `http://personal-ai:8600/remind`，可用 `REMIND_URL` 覆盖；
+3. 默认目标是 ntfy；要投提醒服务需显式配置 `REMIND_URL`；
 4. 若对端配置了口令（`APP_PASSWORD`），用同名环境变量带上 token，未配置则不校验。
 """
 
@@ -17,7 +17,8 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-REMIND_URL = os.getenv("REMIND_URL", "http://personal-ai:8600/remind")
+# 留空 = 不启用提醒服务通道（默认）。要联动个人事务项目时再显式配置。
+REMIND_URL = os.getenv("REMIND_URL", "").strip()
 TIMEOUT = float(os.getenv("REMIND_TIMEOUT", "4"))
 QUEUE_FILE = Path(os.getenv("NOTIFY_QUEUE", str(Path(__file__).parent / "notifications.jsonl")))
 WEBHOOK = os.getenv("NOTIFY_WEBHOOK", "").strip()
@@ -179,10 +180,28 @@ def send(content: str, at: str = "", repeat: str = "once", url: str = None,
     """
     if not content.strip():
         return {"ok": False, "error": "空内容"}
+
+    # 先算出这一条**实际会走几个通道**：一个都没配就别去碰去重表、更别写队列，
+    # 否则队列里会堆一堆永远发不出去的东西，`pending` 数字变成噪音。
+    # 显式传 url 也算「要投提醒服务」——测试和临时脚本靠这个注入失败端点，
+    # 只认环境变量会让 send(url=...) 静默变成「只发 ntfy」，排查时非常误导。
+    remind_url = (url or REMIND_URL or '').strip()
+    enabled = []
+    if remind_url:
+        enabled.append('remind')
+    if WEBHOOK:
+        enabled.append("webhook")
+    if NTFY_TOPIC:
+        enabled.append("ntfy")
+    if not enabled:
+        return {"ok": False, "skipped": True,
+                "reason": "没有任何通知通道（NOTIFY_NTFY / NOTIFY_WEBHOOK / REMIND_URL 都为空）"}
+
     key = dedupe_key or content.strip()[:200]
     if DEDUPE_SECONDS > 0 and _seen_recently(key, DEDUPE_SECONDS):
         return {"ok": True, "deduped": True, "key": key}
     _mark_sent(key)
+
     when = at or (datetime.now() + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
     payload = {
         "content": content.strip()[:500],
@@ -191,23 +210,25 @@ def send(content: str, at: str = "", repeat: str = "once", url: str = None,
         "token": os.getenv("REMIND_TOKEN") or os.getenv("APP_PASSWORD", ""),
         "source": "trainAI",
     }
-    target = url or REMIND_URL
     failed = []
-    try:
-        res = _post(payload, target)
-    except Exception as e:  # 连接失败/超时：进队列，不打断主流程
-        res = {"ok": False, "error": f"{type(e).__name__}: {e}"[:160]}
-    if not res.get("ok"):
-        failed.append("remind")
-        res["target"] = target
+    res = {"ok": True, "channels": enabled, "target": remind_url or NTFY_SERVER}
 
-    # 同时推群机器人 / ntfy（配置了才发；各自失败不影响另外两条）
-    if WEBHOOK:
+    if "remind" in enabled:
+        try:
+            r = _post(payload, remind_url)
+        except Exception as e:  # 连接失败/超时：进队列，不打断主流程
+            r = {"ok": False, "error": f"{type(e).__name__}: {e}"[:160]}
+        res["remind"] = r
+        if not r.get("ok"):
+            failed.append("remind")
+
+    # ntfy / 群机器人（配置了才发；各自失败不影响另外两条）
+    if "webhook" in enabled:
         r = webhook_push(content)
         res["webhook"] = r
         if not r.get("ok"):
             failed.append("webhook")
-    if NTFY_TOPIC:
+    if "ntfy" in enabled:
         r = ntfy_push(content)
         res["ntfy"] = r
         if not r.get("ok"):
@@ -218,6 +239,7 @@ def send(content: str, at: str = "", repeat: str = "once", url: str = None,
         _queue(payload)
         res["queued"] = True
         res["failed_channels"] = failed
+        res["ok"] = False
     return res
 
 
@@ -233,7 +255,9 @@ def pending() -> int:
 
 def _retry(payload: dict, url: str = None) -> list:
     """重试一个积压 payload 里失败过的通道，返回仍然失败的通道名。"""
-    chans = payload.get("channels") or ["remind"]  # 老队列没有 channels 字段，按提醒服务处理
+    # 老队列没有 channels 字段：那时默认走提醒服务；现在若提醒服务已关闭，
+    # 就按当前唯一启用的通道重试，否则这些积压会永远发不出去。
+    chans = payload.get("channels") or (["remind"] if REMIND_URL else ["ntfy"])
     text = payload.get("content", "")
     still = []
     for ch in chans:

@@ -169,21 +169,40 @@ print(res.excluded_text())  # 被排除的方案 + 具体原因（超预算 / �
 python test_planner.py
 ```
 
-## 🔔 通知联动（盯票命中 → 系统提醒）
+## 🔔 通知（盯票命中 → 手机）
 
-盯票命中或放弃时，`notify.send()` 会把消息投递给 PersonalAI 的提醒服务（`/remind`），
-由它落库并在你下次打开页面时弹出确认：
+盯票命中或放弃时调 `notify.send()`，**主通道是 ntfy**（手机装个 App 订阅一个 topic 就完），
+不依赖任何其他服务：
 
 ```python
 import notify
-notify.send("盯票命中：G1234 二等座 ¥553", at="")   # at 为空 = 马上
+notify.send("盯票命中：G1234 二等座 ¥553", dedupe_key="g1|G1234")  # dedupe_key 防重复
 notify.pending()   # 队列里还有几条没发出去
 notify.drain()     # 补发
 ```
 
-投递失败**不会阻塞决策**：消息进本地队列（`notifications.jsonl`），下次补发。
-口令通过 `REMIND_TOKEN`（或 `APP_PASSWORD`）传递，服务端未配置口令时容器内直通。
+三个通道各自独立，配了哪个走哪个：
 
+| 通道 | 开启方式 | 说明 |
+|---|---|---|
+| ntfy（推荐） | `NOTIFY_NTFY=<topic>` | 主通道，手机 App 订阅；自建服务器用 `NOTIFY_NTFY_SERVER` |
+| 群机器人 | `NOTIFY_WEBHOOK=<url>` | 飞书 / 钉钉 / 企业微信，按域名自动选载荷 |
+| 提醒服务（可选） | `REMIND_URL=<url>` | 投给 PersonalAI 的 `/remind`，能进它的提醒列表；**留空即完全关闭** |
+
+> **2026-11-20 的改动**：以前 `REMIND_URL` 默认指向 personal-ai 的提醒服务，等于盯票的通知
+> 依赖另一个项目活着 —— 那个项目重启的几秒里通知投不进去，它界面上的问题也会牵连过来。
+> 现在默认走 ntfy，`REMIND_URL` 留空就完全不碰它；想联动时显式配一行即可。
+
+失败**不会阻塞决策**：只有失败过的通道会进本地队列（`notifications.jsonl`），
+下次 `drain()` 只重试这些，成功的不重发（否则手机会收到两遍）。
+一个通道都没配时直接 `skipped`，不写队列。
+
+```bash
+python notify.py --ntfy "测试：手机能不能收到"   # 单独验 ntfy
+python notify.py --push "测试：群机器人"        # 单独验 webhook
+python notify.py --pending                     # 队列里积了几条
+python notify.py --drain                       # 手动补发一次
+```
 
 ## 🎫 出票卡片与群机器人推送
 
@@ -262,7 +281,7 @@ docker compose exec -T train-ai python notify.py --ntfy "测试：来自 trainAI
 
 ## 🔁 通知发失败会自动补发
 
-盯票命中的通知有三个出口（提醒服务 / 群机器人 / ntfy），任何一条失败都会被写进
+盯票命中的通知有多个出口（ntfy / 群机器人 / 可选提醒服务），任何一条失败都会被写进
 `notifications.jsonl` 队列，但**光写队列不够**——以前只有手动 `python notify.py --drain`
 才会重发，等于"任务显示命中了，人永远没收到"。
 
@@ -280,7 +299,7 @@ docker compose exec -T watch-worker python notify.py --pending
 docker compose exec -T watch-worker python notify.py --drain
 ```
 
-实测链路：往队列里塞一条 → `drain` 返回 `{'sent': 1, 'left': 0}` → `reminders` 表出现对应一行。
+实测链路（解耦后，2026-11-20）：往队列里塞一条 → `drain` 返回 `{'sent': 1, 'left': 0}` → ntfy 手机端收到，`reminders` 表**不再**新增行。
 
 ### 通知去重（NOTIFY_DEDUPE_SECONDS）
 

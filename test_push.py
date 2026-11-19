@@ -275,6 +275,63 @@ def main():
             sys.modules["requests"] = old_req2
         notify.QUEUE_FILE, notify.REMIND_URL = old_q2, old_url2
 
+    # ---- 解耦之后：ntfy 是主通道，提醒服务默认关闭 ----
+    # 起因：盯票的通知以前必须经过 PersonalAI 的提醒服务，那个项目一重启/界面一出问题，
+    # 盯票这块就被牵连。现在 REMIND_URL 留空就完全不走它。
+    import tempfile as _tf2
+    from pathlib import Path as _P2
+
+    tmp3 = _P2(_tf2.mkdtemp()) / "q3.jsonl"
+    old_q3 = notify.QUEUE_FILE
+    old_url3, old_topic3 = notify.REMIND_URL, notify.NTFY_TOPIC
+    notify.QUEUE_FILE = tmp3
+    notify.REMIND_URL = ""
+    notify.NTFY_TOPIC = "dingpiao-test"
+    old_req3 = sys.modules.get("requests")
+    try:
+        only_ntfy = router(remind_ok=True)
+        sys.modules["requests"] = only_ntfy
+        r = notify.send("盯票命中 解耦测试")
+        ok("没配提醒服务时也算发成功", r.get("ok") is True, str(r))
+        ok("只走 ntfy 一个通道", r.get("channels") == ["ntfy"], str(r.get("channels")))
+        ok("没有请求打到提醒服务", not any("remind" in u for u in only_ntfy.calls), str(only_ntfy.calls))
+        ok("成功时不写队列", notify.pending() == 0, str(notify.pending()))
+
+        # ntfy 挂了才进队列，且只记 ntfy
+        dead = fake_requests(raises=RuntimeError("断网"))
+        sys.modules["requests"] = dead
+        r2 = notify.send("盯票命中 断网测试")
+        ok("ntfy 失败时返回失败", r2.get("ok") is False, str(r2))
+        ok("失败通道只有 ntfy", r2.get("failed_channels") == ["ntfy"], str(r2.get("failed_channels")))
+        ok("失败进队列", notify.pending() == 1, str(notify.pending()))
+
+        # 补发：REMIND_URL 为空时，老格式（无 channels）也应该走 ntfy，而不是死磕提醒服务
+        tmp3.write_text('{"content":"老的积压","at":"2026-11-19 08:00","repeat":"once"}\n',
+                        encoding="utf-8")
+        back = router(remind_ok=True)
+        sys.modules["requests"] = back
+        res = notify.drain()
+        ok("老格式在解耦后仍能补发", res.get("sent") == 1 and res.get("left") == 0, str(res))
+        ok("补发走的是 ntfy 而不是提醒服务",
+           any("ntfy" in u for u in back.calls) and not any("remind" in u for u in back.calls),
+           str(back.calls))
+
+        # 一个通道都没配：跳过，不写队列（否则队列里全是永远发不出去的垃圾）
+        tmp3.write_text("", encoding="utf-8")
+        notify.REMIND_URL = ""
+        notify.NTFY_TOPIC = ""
+        notify.WEBHOOK = ""
+        r3 = notify.send("没人收的消息")
+        ok("没配任何通道时返回 skipped", r3.get("skipped") is True, str(r3))
+        ok("没配通道时不写队列", notify.pending() == 0, str(notify.pending()))
+        ok("没配通道时不消耗去重窗口", notify._seen_recently("没人收的消息", 600) is False)
+    finally:
+        if old_req3 is None:
+            sys.modules.pop("requests", None)
+        else:
+            sys.modules["requests"] = old_req3
+        notify.QUEUE_FILE, notify.REMIND_URL, notify.NTFY_TOPIC = old_q3, old_url3, old_topic3
+        notify.WEBHOOK = old_hook
     # ---- 出票卡片 ----
     class S:
         date = "2026-11-29"
