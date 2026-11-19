@@ -13,6 +13,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import booking  # noqa: E402
+import json as njson  # noqa: E402
 import notify  # noqa: E402
 
 PASS = 0
@@ -205,7 +206,7 @@ def main():
         sys.modules["requests"] = m2
         before_ntfy = sum(1 for u in m2.calls if "ntfy" in u)
         res = notify.drain()
-        ok("补发成功", res == {"sent": 1, "left": 0}, str(res))
+        ok("补发成功", res.get("sent") == 1 and res.get("left") == 0, str(res))
         ok("补发后队列清空", notify.pending() == 0, str(notify.pending()))
         ok("补发时没有重复推 ntfy", sum(1 for u in m2.calls if "ntfy" in u) == before_ntfy, str(m2.calls))
 
@@ -364,6 +365,25 @@ def main():
 
     ok("空方案返回空串", booking.card_text(None) == "" and booking.one_line(None) == "")
     ok("缺参数不生成链接", booking.search_link("", "上海", "2026-11-29") == "")
+
+    # ---- 10. 目标通道已关闭的积压：丢弃而不是无限重试
+    notify.QUEUE_FILE.write_text(
+        njson.dumps({"content": "老积压：只投提醒服务", "channels": ["remind"]}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    notify.REMIND_URL = ""
+    res = notify.drain()
+    ok("通道已关的积压被丢弃", res.get("dropped") == 1 and res.get("left") == 0, str(res))
+    ok("丢弃后队列为空", notify.pending() == 0, str(notify.pending()))
+
+    # 显式给了 url 仍算要投提醒服务（临时补发/测试注入靠这个）
+    notify.QUEUE_FILE.write_text(
+        njson.dumps({"content": "指定端点的积压", "channels": ["remind"]}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    res = notify.drain(url="http://127.0.0.1:1/remind")
+    ok("显式 url 时不丢弃、失败仍保留", res.get("dropped") == 0 and res.get("left") == 1, str(res))
+    notify.QUEUE_FILE.unlink()
 
     print("-" * 72)
     print(f"通过 {PASS} / 失败 {FAIL}")

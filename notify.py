@@ -253,11 +253,34 @@ def pending() -> int:
         return 0
 
 
+def _channel_enabled(ch: str) -> bool:
+    """这个通道现在还配着吗。
+
+    解耦之后提醒服务默认关闭（REMIND_URL 为空），老队列里 `channels: ["remind"]`
+    的积压会永远重试失败——实测一条测试消息在队列里躺了 5 小时，
+    worker 每 5 分钟打一行「发出 0 条，剩余 1 条」，纯噪音。
+    """
+    if ch == "remind":
+        return bool(REMIND_URL)
+    if ch == "ntfy":
+        return bool(NTFY_TOPIC)
+    if ch == "webhook":
+        return bool(WEBHOOK)
+    return False
+
+
 def _retry(payload: dict, url: str = None) -> list:
-    """重试一个积压 payload 里失败过的通道，返回仍然失败的通道名。"""
+    """重试一个积压 payload 里失败过的通道，返回仍然失败的通道名。
+
+    返回 `None` 表示「目标通道现在全都关了」，调用方应把这条从队列里丢掉，
+    而不是无限重试。
+    """
     # 老队列没有 channels 字段：那时默认走提醒服务；现在若提醒服务已关闭，
     # 就按当前唯一启用的通道重试，否则这些积压会永远发不出去。
     chans = payload.get("channels") or (["remind"] if REMIND_URL else ["ntfy"])
+    chans = [c for c in chans if _channel_enabled(c) or (c == "remind" and url)]
+    if not chans:
+        return None
     text = payload.get("content", "")
     still = []
     for ch in chans:
@@ -279,10 +302,14 @@ def _retry(payload: dict, url: str = None) -> list:
 
 
 def drain(url: str = None) -> dict:
-    """补发队列；成功的移出，失败的保留（只重试失败过的通道）。返回 {sent, left}。"""
+    """补发队列；成功的移出，失败的保留（只重试失败过的通道）。
+
+    返回 `{sent, left, dropped}`——`dropped` 是「目标通道都已关闭」被丢弃的条数，
+    单独计数，免得看起来像丢消息。
+    """
     if not QUEUE_FILE.exists():
-        return {"sent": 0, "left": 0}
-    sent, left = 0, []
+        return {"sent": 0, "left": 0, "dropped": 0}
+    sent, dropped, left = 0, 0, []
     for line in QUEUE_FILE.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
@@ -292,6 +319,9 @@ def drain(url: str = None) -> dict:
         except json.JSONDecodeError:
             continue
         still = _retry(payload, url)
+        if still is None:
+            dropped += 1
+            continue
         if still:
             payload["channels"] = still
             left.append(payload)
@@ -303,7 +333,7 @@ def drain(url: str = None) -> dict:
         )
     except OSError:
         pass
-    return {"sent": sent, "left": len(left)}
+    return {"sent": sent, "left": len(left), "dropped": dropped}
 
 
 if __name__ == "__main__":
