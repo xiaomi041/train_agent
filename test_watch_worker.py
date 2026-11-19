@@ -5,6 +5,7 @@ run: python test_watch_worker.py
 from __future__ import annotations
 
 import sys
+import shutil
 import tempfile
 import traceback
 from pathlib import Path
@@ -52,8 +53,12 @@ class Clock:
         self.t += dt
 
 
+TMP_DIRS: list = []
+
+
 def temp_store() -> watch.Store:
     d = tempfile.mkdtemp(prefix="watchworker_")
+    TMP_DIRS.append(d)
     return watch.Store(Path(d) / "watch.db")
 
 
@@ -285,6 +290,8 @@ def test_heartbeat_reports_progress():
         logger.removeHandler(h)
 
     store._conn.close()
+
+
 def main() -> int:
     tests = [
         test_only_due_goals,
@@ -305,6 +312,8 @@ def main() -> int:
             FAIL += 1
             print(f"  ERROR {t.__name__}")
             traceback.print_exc()
+    for d in TMP_DIRS:                      # 容器里 TMPDIR 可能是 /app，别留下垃圾
+        shutil.rmtree(d, ignore_errors=True)
     print(f"\n{'='*52}\n结果：{PASS} 通过，{FAIL} 失败\n{'='*52}")
     return 0 if FAIL == 0 else 1
 

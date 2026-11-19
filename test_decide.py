@@ -6,6 +6,7 @@
 
 run: python test_decide.py
 """
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -53,6 +54,7 @@ class Tmp:
 
     def close(self):
         self.store._conn.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- 1. 规则版
@@ -172,6 +174,78 @@ def test_exhausted():
     t.close()
 
 
+# ---------------------------------------------------------------- 8. 缓存与配额
+def test_cache_and_quota():
+    print("\n[8] 模型版默认开启：缓存省调用，配额防烧钱，异常一律退回规则")
+    calls = {"n": 0}
+
+    def fake_ask(text):
+        calls["n"] += 1
+        return '{"relax": "money"}'
+
+    real_ask = decider._ask_model
+    real_quota = decider.QUOTA_PER_HOUR
+    decider._ask_model = fake_ask
+    try:
+        decider.clear_cache()
+        decider.reset_stats()
+        g = make_goal()
+
+        r1 = decider.llm_decider(g, [], list(watch.RELAX_ORDER), None, [])
+        r2 = decider.llm_decider(g, [], list(watch.RELAX_ORDER), None, [])
+        ok("模型选了 money", r1 == "money", r1)
+        ok("同一局面第二次直接命中缓存（只调 1 次模型）", calls["n"] == 1, calls["n"])
+        ok("缓存命中计数为 1", decider.stats()["cache_hits"] == 1, decider.stats())
+
+        g2 = make_goal(budget=800.0)   # 约束变了 = 新局面
+        decider.llm_decider(g2, [], list(watch.RELAX_ORDER), None, [])
+        ok("换约束后要重新问模型（累计 2 次）", calls["n"] == 2, calls["n"])
+
+        # 配额：同一任务每小时只允许 N 次
+        decider.clear_cache()
+        decider.QUOTA_PER_HOUR = 2
+        calls["n"] = 0
+        gid_goal = make_goal()
+        for i in range(3):
+            gg = make_goal(id=gid_goal.id, budget=600.0 + i)   # 三个不同局面，同一任务
+            decider.llm_decider(gg, [], list(watch.RELAX_ORDER), None, [])
+        ok("配额用完：第 3 次不再调模型（共 2 次）", calls["n"] == 2, calls["n"])
+        ok("配额拦截计入配额计数", decider.stats()["quota_blocks"] == 1, decider.stats())
+
+        # 坏 JSON：不抛异常，按「等」处理，且计入 bad_json
+        decider.clear_cache()
+        decider.QUOTA_PER_HOUR = real_quota
+        decider.reset_stats()
+        decider._ask_model = lambda text: "我觉得应该放宽预算"
+        r = decider.llm_decider(make_goal(), [], list(watch.RELAX_ORDER), None, [])
+        ok("模型答非 JSON → 返回 None（让上层用规则）", r is None, r)
+        ok("坏 JSON 计入统计", decider.stats()["bad_json"] == 1, decider.stats())
+
+        # 模型异常：返回 None，且不写缓存（下次还会问）
+        decider.clear_cache()
+        boom_calls = {"n": 0}
+
+        def boom(text):
+            boom_calls["n"] += 1
+            raise RuntimeError("网络挂了")
+
+        decider._ask_model = boom
+        r = decider.llm_decider(make_goal(), [], list(watch.RELAX_ORDER), None, [])
+        ok("模型异常 → 返回 None 而不是抛出去", r is None, r)
+        decider.llm_decider(make_goal(id="same-goal"), [], list(watch.RELAX_ORDER), None, [])
+        ok("异常结果不写缓存（两次都真的调了）", boom_calls["n"] == 2, boom_calls["n"])
+    finally:
+        decider._ask_model = real_ask
+        decider.QUOTA_PER_HOUR = real_quota
+        decider.clear_cache()
+        decider.reset_stats()
+
+    ok("make_decider() 默认是模型版", decider.make_decider() is decider.llm_decider)
+    ok("配置写错（bogus）也不会让盯票停摆，退回规则",
+       decider.make_decider("bogus") is decider.rule_decider)
+    ok("显式 rule 仍是规则版", decider.make_decider("rule") is decider.rule_decider)
+
+
 def main():
     test_rule()
     test_pick_dim()
@@ -180,6 +254,7 @@ def main():
     test_watcher_applies()
     test_wait_budget()
     test_exhausted()
+    test_cache_and_quota()
     print(f"\n结果：{PASS} 通过，{FAIL} 失败")
     return 1 if FAIL else 0
 

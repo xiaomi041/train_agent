@@ -425,8 +425,39 @@ def _transfer_schemes(goal: Goal, hub: str, d: str, sleep_between: float) -> lis
     return res
 
 
-# ---------------------------------------------------------------- 决策
+# ---------------------------------------------------------------- 改约束
 
+# 允许在运行中修改的字段。刻意做成白名单：`id`/`owner`/`status` 这些不该被界面顺手改掉。
+EDITABLE = {
+    "origin", "dest", "date", "budget", "max_minutes",
+    "arrive_after", "arrive_before", "seat_prefs", "strict_seat",
+    "max_transfers", "allow_transfer", "flex_days", "interval_sec", "note",
+}
+
+
+def edit_goal(goal: Goal, **changes) -> Goal:
+    """改约束：改完把「放宽状态」清零，否则旧的放宽会继续生效。
+
+    为什么要清零：放宽记录是「为了让这次搜索命中而降级过什么」。用户一旦换了预算
+    或日期，那些放宽理由可能已经失效（比如原来超预算 20 元，现在预算调高就不超了），
+    继续沿用会让判定偏松 —— 买到一趟其实不满足新约束的车。
+
+    改完如果是 done/failed，顺手复活成 active：用户改约束的意思通常是"再盯一次"。
+    """
+    unknown = set(changes) - EDITABLE
+    if unknown:
+        raise KeyError(f"不可修改的字段：{', '.join(sorted(unknown))}")
+    for k, v in changes.items():
+        setattr(goal, k, v)
+    goal.relax_dims = []
+    goal.relax_level = 0
+    if goal.status in ("done", "failed"):
+        goal.status = "active"
+        goal.note = ""
+    return goal
+
+
+# ---------------------------------------------------------------- 决策
 # 可以放宽的维度总数就是「最多能升几级」；老代码里写死的 4 已经不够用了
 # 模型版连续说「先等等」的上限，用完退回规则顺序，避免任务卡在原地
 MAX_MODEL_WAITS = int(__import__('os').getenv('DECIDE_MAX_WAITS', '3'))

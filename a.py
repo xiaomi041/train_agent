@@ -20,6 +20,7 @@ import booking
 import decider
 import notify
 import planner
+import policy
 import watch
 from agno.models.deepseek import DeepSeek
 
@@ -855,8 +856,13 @@ with st.expander("➕ 新建盯票任务", expanded=False):
                      "先停掉一个再新建 —— 每个任务都在按间隔查 12306，堆太多只会互相拖慢。")
             st.stop()
         goal.owner = _owner()
+        # 反馈闭环：这条线路以前被标过误报的席别，默认不再收（收紧，不放松）
+        _tight = policy.for_route(_wstore, goal.origin, goal.dest)
+        _removed = policy.apply(goal, _tight)
         _wstore.save_goal(goal)
         st.success(f"已创建：{goal.origin} → {goal.dest} {goal.date}（任务 {goal.id}）")
+        if _removed:
+            st.warning("⚠️ 按历史误报调整了席别：" + _tight.advice())
         st.rerun()
 
 _wgoals = _wstore.list_goals(owner=_owner())
@@ -897,6 +903,38 @@ if _wgoals:
             if g.note:
                 st.caption(g.note)
 
+            # 改约束：agent 得能接受"人类中途改主意"，改完立刻按新约束查一次。
+            with st.expander("✏️ 改约束（改完清零放宽状态，并立即检查一次）"):
+                ec1, ec2, ec3 = st.columns(3)
+                e_budget = ec1.number_input("预算上限（元，0=不限）", 0.0, 5000.0,
+                                            float(g.budget or 0), 50.0, key=f"eb_{g.id}")
+                e_maxmin = ec2.number_input("总耗时上限（分钟，0=不限）", 0, 4000,
+                                            int(g.max_minutes or 0), 30, key=f"em_{g.id}")
+                e_date = ec3.text_input("出发日期（YYYY-MM-DD）", g.date, key=f"ed_{g.id}")
+                e_seats = st.multiselect(
+                    "席别偏好（按顺序）",
+                    ["二等座", "一等座", "硬卧", "硬座", "软卧", "无座", "商务座"],
+                    default=[s for s in g.seat_prefs],
+                    key=f"es_{g.id}",
+                )
+                if st.button("保存新约束并立即检查一次", key=f"edit_{g.id}"):
+                    if g.status == "stopped":
+                        g.status = "active"      # 手动停掉的，用户来改就说明想继续
+                    watch.edit_goal(
+                        g,
+                        budget=float(e_budget) or None,
+                        max_minutes=int(e_maxmin) or None,
+                        date=(e_date.strip() or g.date),
+                        seat_prefs=e_seats or g.seat_prefs,
+                    )
+                    _wstore.save_goal(g)
+                    with st.spinner("按新约束查一次 12306..."):
+                        d = watch.Watcher(g, fetcher=_watch_fetcher, store=_wstore,
+                                          notifier=notify.send,
+                                          decider=decider.make_decider()).tick()
+                    st.info(d.summary())
+                    st.rerun()
+
             # 命中了就给「出票卡片」：一键直达 12306 查询页 + 可复制的车次信息。
             # 不做自动下单 —— 托管登录态和支付密码的风险远大于省下的那两次点击。
             if g.status == "done":
@@ -922,14 +960,16 @@ if _wgoals:
                         st.rerun()
                     if fb2.button("🙅 不是我要的", key=f"wrong_{g.id}"):
                         _wstore.feedback(g.id, "wrong")
-                        st.warning("记下了。这次命中算误报——调整约束（预算/时段/席别）重新建一个会更准。")
+                        _adv = policy.for_route(_wstore, g.origin, g.dest).advice()
+                        st.warning("记下了。这次命中算误报——调整约束（预算/时段/席别）重新建一个会更准。"
+                                   + (("\n\n" + _adv) if _adv else ""))
                         st.rerun()
 
             bc1, bc2 = st.columns([1.2, 3.8])
             if g.status == "active" and bc1.button("立即检查一次", key=f"tick_{g.id}"):
                 with st.spinner("查一次 12306..."):
                     d = watch.Watcher(g, fetcher=_watch_fetcher, store=_wstore, notifier=notify.send,
-                                        decider=decider.make_decider(os.getenv("DECIDE_MODE", "rule"))).tick()
+                                        decider=decider.make_decider()).tick()
                 st.info(d.summary())
                 st.rerun()
             if g.status == "active" and bc2.button("停止这个任务", key=f"stop_{g.id}"):
@@ -941,7 +981,7 @@ if _wgoals:
                 # 这里不再提供"在本页开线程"的按钮 —— 那会造成两个轮询器重复查接口。
                 st.caption(f"🛰 后台常驻进程每 {g.interval_sec} 秒检查一次（没票时自动退避到最多 4 倍间隔），"
                            "关掉本页也会继续；命中后通过提醒服务通知你。")
-                _mode = os.getenv("DECIDE_MODE", "rule")
+                _mode = os.getenv("DECIDE_MODE", "llm")
                 st.caption(("本轮放宽策略：模型挑选（llm）" if _mode == "llm" else "本轮放宽策略：固定顺序（rule）")
                            + "；已放宽：" + ("、".join(watch.RELAX_LABEL[d] for d in watch.relax_dims(g)) or "无"))
 

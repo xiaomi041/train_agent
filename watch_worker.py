@@ -92,9 +92,8 @@ class WatchWorker:
         self.fetcher = fetcher or watch.real_fetcher
         self.notifier = notifier if notifier is not None else notify.send
         self.drainer = drainer if drainer is not None else notify.drain
-        # 放宽策略：DECIDE_MODE=rule（默认，零成本）或 llm（让模型挑放宽哪一项）
-        self.decider = decider if decider is not None else \
-            decider_mod.make_decider(os.getenv("DECIDE_MODE", "rule"))
+        # 放宽策略：DECIDE_MODE=llm（默认，让模型挑放宽哪一项）或 rule（零成本固定顺序）
+        self.decider = decider if decider is not None else decider_mod.make_decider()
         self.clock = clock
         self._due: dict[str, float] = {}
         self._backoff: dict[str, float] = {}

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -87,23 +88,40 @@ def run_one(name: str, kind: str, max_ticks: int = 8) -> dict:
     store = watch.Store(tmp / "w.db")
     calls = {"n": 0, "in": 0, "out": 0}
 
-    def counted(*a, **kw):
-        """给模型版记调用次数与 token（成本要算进对照表）。"""
+    # 这里只比较「规则 vs 模型」的决策质量，所以把小时配额放开，
+    # 否则一个场景跑 8 轮就会撞上限额，把成本对比变成"被限额截断"的对比。
+    real_quota = decider.QUOTA_PER_HOUR
+    decider.QUOTA_PER_HOUR = 999
+    decider.clear_cache()
+    decider.reset_stats()
+    real_ask = decider._ask_model
+
+    def counting_ask(text):
+        """记真实模型调用与 token（缓存命中不该算钱）。"""
         calls["n"] += 1
-        out = decider.llm_decider(*a, **kw)
+        out = real_ask(text)
         u = getattr(decider, "LAST_USAGE", {}) or {}
         calls["in"] += int(u.get("in", 0) or 0)
         calls["out"] += int(u.get("out", 0) or 0)
         return out
 
-    dec = counted if kind == "llm" else decider.rule_decider
+    dec = decider.llm_decider if kind == "llm" else decider.rule_decider
     w = watch.Watcher(goal, fetcher=fetcher, store=store, sleep=lambda s: None, decider=dec)
 
     decision = None
-    for _ in range(max_ticks):
-        decision = w.tick()
-        if decision.action in ("命中", "放弃"):
-            break
+    try:
+        if kind == "llm":
+            decider._ask_model = counting_ask
+        for _ in range(max_ticks):
+            decision = w.tick()
+            if decision.action in ("命中", "放弃"):
+                break
+        dstats = decider.stats()
+    finally:
+        decider._ask_model = real_ask
+        decider.QUOTA_PER_HOUR = real_quota
+        decider.clear_cache()
+
     out = {
         "scenario": name,
         "kind": kind,
@@ -113,9 +131,12 @@ def run_one(name: str, kind: str, max_ticks: int = 8) -> dict:
         "dims_opened": len(goal.relax_dims),
         "fetches": fetcher.calls["n"],
         "llm_calls": calls["n"],
+        "cache_hits": dstats["cache_hits"] if kind == "llm" else 0,
         "tokens": calls["in"] + calls["out"],
     }
     store._conn.close()
+    # 容器里 TMPDIR 可能指向 /app，不清理会在镜像工作目录里堆一堆 dec-* 目录
+    shutil.rmtree(tmp, ignore_errors=True)
     return out
 
 
@@ -132,12 +153,13 @@ def main() -> None:
             rows.append(run_one(name, kind, args.ticks))
 
     head = (f"{'场景':<10}{'决策器':<6}{'结论':<6}{'轮数':>4}"
-            f"{'放宽':>5}{'请求':>5}{'模型调用':>7}{'token':>7}")
+            f"{'放宽':>5}{'请求':>5}{'模型调用':>7}{'缓存':>5}{'token':>7}")
     print(head)
     print("-" * 60)
     for r in rows:
         print(f"{r['scenario']:<10}{r['kind']:<6}{r['action']:<6}{r['ticks']:>4}"
-              f"{r['dims_opened']:>5}{r['fetches']:>5}{r['llm_calls']:>7}{r['tokens']:>7}")
+              f"{r['dims_opened']:>5}{r['fetches']:>5}{r['llm_calls']:>7}"
+              f"{r['cache_hits']:>5}{r['tokens']:>7}")
 
     print()
     for kind in ("rule", "llm"):
@@ -148,6 +170,7 @@ def main() -> None:
               f"请求 {sum(r['fetches'] for r in sel):>2} 次 | "
               f"命中 {sum(1 for r in sel if r['action'] == '命中')}/{len(sel)} | "
               f"模型调用 {sum(r['llm_calls'] for r in sel)} 次 | "
+              f"缓存命中 {sum(r['cache_hits'] for r in sel)} 次 | "
               f"约 ¥{cost:.4f}")
 
 

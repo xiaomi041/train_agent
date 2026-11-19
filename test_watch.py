@@ -313,6 +313,34 @@ def test_fetcher_dedupes_same_train(monkeypatch_target=None):
     ok("重复车次只留一条", len(schemes) == 1, len(schemes))
 
 
+def test_edit_goal_resets_relax():
+    """改约束必须清零放宽状态：否则旧的「放宽理由」会继续生效，判定偏松。"""
+    print("\n[13] 改约束：清零放宽、复活已结束的任务、拒绝改不该改的字段")
+    g = Goal(origin="北京", dest="上海", date="2026-12-01", budget=600.0)
+    g.relax_dims = ["transfer", "money"]
+    g.relax_level = 2
+    g.status = "done"
+    g.note = "已命中 G1"
+
+    watch.edit_goal(g, budget=900.0, date="2026-12-03")
+    ok("预算改成功", g.budget == 900.0, g.budget)
+    ok("日期改成功", g.date == "2026-12-03", g.date)
+    ok("放宽记录清零", g.relax_dims == [] and g.relax_level == 0, (g.relax_dims, g.relax_level))
+    ok("done 的任务被复活成 active", g.status == "active", g.status)
+    ok("旧的命中备注被清掉", g.note == "", g.note)
+
+    try:
+        watch.edit_goal(g, status="stopped")
+        ok("改 status 应该被拒绝", False)
+    except KeyError as e:
+        ok("改 status 被拒绝（白名单之外）", "status" in str(e), str(e))
+
+    g2 = Goal(origin="北京", dest="上海", date="2026-12-01")
+    g2.status = "stopped"
+    watch.edit_goal(g2, budget=500.0)
+    ok("主动停止的任务不会被复活（只有 done/failed 复活）", g2.status == "stopped", g2.status)
+
+
 def main():
     tests = [
         test_goal_verifiable,
@@ -327,6 +355,7 @@ def main():
         test_no_ticket_keeps_waiting,
         test_fetcher_no_station_expansion,
         test_fetcher_dedupes_same_train,
+        test_edit_goal_resets_relax,
     ]
     for t in tests:
         try:
