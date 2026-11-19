@@ -196,6 +196,47 @@ def test_notifier_failure_is_swallowed():
 
 
 # ---------------------------------------------------------------- 7
+def test_drain_runs_on_heartbeat():
+    print("\n[7] 通知队列按间隔自动补发（以前只有手动 --drain 才会发）")
+    store = temp_store()
+    clock = Clock()
+    calls = []
+
+    def fake_drain():
+        calls.append(clock.t)
+        return {"sent": 1, "left": 0}
+
+    fetcher = lambda g: []  # noqa: E731
+    g = make_goal()
+    store.save_goal(g)
+    w = watch_worker.WatchWorker(store=store, fetcher=fetcher,
+                                 notifier=lambda _t: {"ok": True},
+                                 clock=clock, drainer=fake_drain)
+    w.run_once()
+    ok("第一轮就补发了一次（启动即补）", len(calls) == 1, calls)
+
+    clock.t += 10  # 还没到 300s
+    w.run_once()
+    ok("间隔没到不重复补发", len(calls) == 1, calls)
+
+    clock.t += watch_worker.DRAIN_EVERY + 1
+    w.run_once()
+    ok("到间隔后再次补发", len(calls) == 2, calls)
+
+    def boom():
+        raise RuntimeError("队列文件坏了")
+
+    w2 = watch_worker.WatchWorker(store=store, fetcher=fetcher,
+                                  notifier=lambda _t: {"ok": True},
+                                  clock=clock, drainer=boom)
+    try:
+        w2.run_once()
+        ok("补发异常不打断轮询", True)
+    except Exception as e:
+        ok("补发异常不打断轮询", False, repr(e))
+
+
+# ---------------------------------------------------------------- 8
 def test_cli_once():
     print("\n[7] --once 正常退出（调试入口可用）")
     code = watch_worker.main(["--once"])
@@ -210,6 +251,7 @@ def main() -> int:
         test_exception_does_not_kill,
         test_only_active_goals,
         test_notifier_failure_is_swallowed,
+        test_drain_runs_on_heartbeat,
         test_cli_once,
     ]
     for t in tests:

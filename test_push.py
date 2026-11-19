@@ -164,6 +164,72 @@ def main():
     notify.NTFY_TOPIC = old_topic
     notify.NTFY_SERVER = old_srv
 
+    # ---- 队列：只补发失败过的通道 ----
+    # 现实场景：提醒服务（reminder-worker）那一刻挂了，但 ntfy 是通的。
+    # 如果补发时把三条都重发一遍，手机会收到两条一模一样的消息。
+    import tempfile
+    from pathlib import Path
+
+    tmp = Path(tempfile.mkdtemp()) / "q.jsonl"
+    old_queue, old_topic, old_url = notify.QUEUE_FILE, notify.NTFY_TOPIC, notify.REMIND_URL
+    notify.QUEUE_FILE = tmp
+    notify.NTFY_TOPIC = "dingpiao-test"
+    notify.REMIND_URL = "http://remind.invalid/remind"
+
+    def router(remind_ok=True):
+        mod = types.ModuleType("requests")
+        calls = []
+
+        def post(url, json=None, timeout=None, data=None, headers=None):
+            calls.append(url)
+            if "remind.invalid" in url:
+                return FakeResp(200, {"ok": remind_ok}) if remind_ok else FakeResp(500, {})
+            return FakeResp(200, {"id": "abc"})
+
+        mod.post = post
+        mod.calls = calls
+        return mod
+
+    old_req = sys.modules.get("requests")
+    try:
+        m = router(remind_ok=False)
+        sys.modules["requests"] = m
+        r = notify.send("盯票命中 测试")
+        ok("提醒服务挂了也返回结果", r.get("ok") is False, str(r))
+        ok("记下失败通道只有 remind", r.get("failed_channels") == ["remind"], str(r.get("failed_channels")))
+        ok("ntfy 那条仍算成功", r.get("ntfy", {}).get("ok") is True, str(r.get("ntfy")))
+        ok("队列里有 1 条", notify.pending() == 1, str(notify.pending()))
+
+        # 提醒服务恢复，补发：只重发 remind，不该再推一次 ntfy
+        m2 = router(remind_ok=True)
+        sys.modules["requests"] = m2
+        before_ntfy = sum(1 for u in m2.calls if "ntfy" in u)
+        res = notify.drain()
+        ok("补发成功", res == {"sent": 1, "left": 0}, str(res))
+        ok("补发后队列清空", notify.pending() == 0, str(notify.pending()))
+        ok("补发时没有重复推 ntfy", sum(1 for u in m2.calls if "ntfy" in u) == before_ntfy, str(m2.calls))
+
+        # 还是失败：留在队列里，且通道保持不变
+        m3 = router(remind_ok=False)
+        sys.modules["requests"] = m3
+        notify.send("再试一条")
+        res = notify.drain()
+        ok("仍然失败时保留在队列", res.get("left") == 1 and notify.pending() == 1, str(res))
+
+        # 老格式（没有 channels 字段）按提醒服务处理，不能崩
+        tmp.write_text('{"content":"老的积压","at":"2026-11-19 08:00","repeat":"once"}\n',
+                       encoding="utf-8")
+        m4 = router(remind_ok=True)
+        sys.modules["requests"] = m4
+        res = notify.drain()
+        ok("老格式也能补发", res.get("sent") == 1 and res.get("left") == 0, str(res))
+    finally:
+        if old_req is None:
+            sys.modules.pop("requests", None)
+        else:
+            sys.modules["requests"] = old_req
+        notify.QUEUE_FILE, notify.NTFY_TOPIC, notify.REMIND_URL = old_queue, old_topic, old_url
+
     # ---- 出票卡片 ----
     class S:
         date = "2026-11-29"

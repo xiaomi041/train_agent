@@ -122,7 +122,12 @@ def ntfy_push(text: str, topic: str = "", server: str = "") -> dict:
 
 
 def send(content: str, at: str = "", repeat: str = "once", url: str = None) -> dict:
-    """发一条通知。at 为空表示「马上提醒」（1 分钟后，避免立刻过期）。"""
+    """发一条通知。at 为空表示「马上提醒」（1 分钟后，避免立刻过期）。
+
+    三个通道（提醒服务 / 群机器人 / ntfy）各自独立，**哪条失败了就只补哪条**：
+    payload 里的 `channels` 记下失败通道，`drain()` 只重试它们，成功的不重发，
+    否则「提醒服务挂了但 ntfy 通了」这种情况下手机会收到两遍同样的消息。
+    """
     if not content.strip():
         return {"ok": False, "error": "空内容"}
     when = at or (datetime.now() + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
@@ -134,19 +139,32 @@ def send(content: str, at: str = "", repeat: str = "once", url: str = None) -> d
         "source": "trainAI",
     }
     target = url or REMIND_URL
+    failed = []
     try:
         res = _post(payload, target)
     except Exception as e:  # 连接失败/超时：进队列，不打断主流程
         res = {"ok": False, "error": f"{type(e).__name__}: {e}"[:160]}
     if not res.get("ok"):
+        failed.append("remind")
+        res["target"] = target
+
+    # 同时推群机器人 / ntfy（配置了才发；各自失败不影响另外两条）
+    if WEBHOOK:
+        r = webhook_push(content)
+        res["webhook"] = r
+        if not r.get("ok"):
+            failed.append("webhook")
+    if NTFY_TOPIC:
+        r = ntfy_push(content)
+        res["ntfy"] = r
+        if not r.get("ok"):
+            failed.append("ntfy")
+
+    if failed:
+        payload["channels"] = failed
         _queue(payload)
         res["queued"] = True
-        res["target"] = target
-    # 同时推群机器人 / ntfy（配置了才发；失败了不影响提醒服务那条链路）
-    if WEBHOOK:
-        res["webhook"] = webhook_push(content)
-    if NTFY_TOPIC:
-        res["ntfy"] = ntfy_push(content)
+        res["failed_channels"] = failed
     return res
 
 
@@ -160,8 +178,31 @@ def pending() -> int:
         return 0
 
 
+def _retry(payload: dict, url: str = None) -> list:
+    """重试一个积压 payload 里失败过的通道，返回仍然失败的通道名。"""
+    chans = payload.get("channels") or ["remind"]  # 老队列没有 channels 字段，按提醒服务处理
+    text = payload.get("content", "")
+    still = []
+    for ch in chans:
+        if ch == "remind":
+            body = {k: v for k, v in payload.items() if k != "channels"}
+            try:
+                res = _post(body, url or REMIND_URL)
+            except Exception:
+                res = {"ok": False}
+            if not res.get("ok"):
+                still.append("remind")
+        elif ch == "webhook":
+            if not webhook_push(text).get("ok"):
+                still.append("webhook")
+        elif ch == "ntfy":
+            if not ntfy_push(text).get("ok"):
+                still.append("ntfy")
+    return still
+
+
 def drain(url: str = None) -> dict:
-    """补发队列；成功的移除，失败的保留。返回 {sent, left}。"""
+    """补发队列；成功的移出，失败的保留（只重试失败过的通道）。返回 {sent, left}。"""
     if not QUEUE_FILE.exists():
         return {"sent": 0, "left": 0}
     sent, left = 0, []
@@ -173,17 +214,18 @@ def drain(url: str = None) -> dict:
             payload = json.loads(line)
         except json.JSONDecodeError:
             continue
-        try:
-            res = _post(payload, url or REMIND_URL)
-        except Exception:
-            res = {"ok": False}
-        if res.get("ok"):
-            sent += 1
-        else:
+        still = _retry(payload, url)
+        if still:
+            payload["channels"] = still
             left.append(payload)
-    QUEUE_FILE.write_text(
-        "".join(json.dumps(p, ensure_ascii=False) + "\n" for p in left), encoding="utf-8"
-    )
+        else:
+            sent += 1
+    try:
+        QUEUE_FILE.write_text(
+            "".join(json.dumps(p, ensure_ascii=False) + "\n" for p in left), encoding="utf-8"
+        )
+    except OSError:
+        pass
     return {"sent": sent, "left": len(left)}
 
 

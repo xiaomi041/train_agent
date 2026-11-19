@@ -57,6 +57,9 @@ CONCURRENCY = max(1, int(os.getenv("WATCH_CONCURRENCY", "4")))
 PRUNE_EVERY = int(os.getenv("WATCH_PRUNE_SECONDS", "1800"))
 PRUNE_KEEP_PER_GOAL = int(os.getenv("WATCH_KEEP_EVENTS", "200"))
 PRUNE_KEEP_DAYS = int(os.getenv("WATCH_KEEP_DAYS", "30"))
+# 补发通知队列的间隔（秒）。通知失败会进 `notifications.jsonl`，但以前只有手动
+# `notify.py --drain` 才会重发 —— 等于没人管。挂在常驻进程的心跳上才对。
+DRAIN_EVERY = int(os.getenv("WATCH_DRAIN_SECONDS", "300"))
 
 # 「等待」意味着"现在没票/暂时失败"，继续按原频率查收益很低
 _CALM_ACTIONS = {"等待"}
@@ -79,15 +82,18 @@ class WatchWorker:
         fetcher: Optional[watch.Fetcher] = None,
         notifier: Optional[Callable[[str], dict]] = None,
         clock: Callable[[], float] = time.time,
+        drainer: Optional[Callable[[], dict]] = None,
     ):
         self.store = store or watch.Store()
         self.fetcher = fetcher or watch.real_fetcher
         self.notifier = notifier if notifier is not None else notify.send
+        self.drainer = drainer if drainer is not None else notify.drain
         self.clock = clock
         self._due: dict[str, float] = {}
         self._backoff: dict[str, float] = {}
         self._lock = threading.Lock()
         self._last_prune = 0.0
+        self._last_drain = 0.0
         self._pool: Optional[ThreadPoolExecutor] = None
         self._stop = False
 
@@ -124,13 +130,14 @@ class WatchWorker:
                 results.append(self._run_one(goal, now))
 
         self._maybe_prune()
+        self._maybe_drain()
         return results
 
     def _maybe_prune(self) -> None:
         """定期裁剪事件表。长时间盯票时这是唯一会无限增长的表。"""
         if PRUNE_EVERY <= 0:
             return
-        now = time.time()
+        now = self.clock()
         if now - self._last_prune < PRUNE_EVERY:
             return
         self._last_prune = now
@@ -141,6 +148,28 @@ class WatchWorker:
                          removed, self.store.event_count(), self.store.db_bytes() / 1024)
         except Exception as e:
             log.warning("裁剪事件表失败（不影响轮询）：%r", e)
+
+    def _maybe_drain(self) -> None:
+        """定期补发通知队列。
+
+        盯票命中时会调 `notify.send`：提醒服务（reminder-worker）那一刻挂掉的话，
+        消息会写进 `notifications.jsonl` 等补发。但补发以前只能手动跑，
+        实际效果就是"任务显示命中了，人永远没收到"。挂在心跳上之后，
+        对端恢复后最多 DRAIN_EVERY 秒就能把积压发出去。
+        """
+        if DRAIN_EVERY <= 0:
+            return
+        now = self.clock()
+        if now - self._last_drain < DRAIN_EVERY:
+            return
+        self._last_drain = now
+        try:
+            res = self.drainer()
+            if res.get("sent") or res.get("left"):
+                log.info("补发通知队列：发出 %d 条，剩余 %d 条",
+                         res.get("sent", 0), res.get("left", 0))
+        except Exception as e:
+            log.warning("补发通知队列失败（不影响轮询）：%r", e)
 
     def _run_one(self, goal: watch.Goal, now: float) -> dict:
         before_level = goal.relax_level
@@ -186,6 +215,7 @@ class WatchWorker:
             "盯票 worker 启动 | 活跃任务轮询间隔 ≤ %ss | 退避上限 %sx | 单轮上限 %d",
             TICK_SECONDS, BACKOFF_MAX, MAX_PER_ROUND,
         )
+        self._last_drain = 0.0  # 启动时立刻补发一次积压
         while not self._stop:
             self.run_once()
             self._sleep(TICK_SECONDS)

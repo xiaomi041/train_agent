@@ -258,6 +258,29 @@ docker compose exec -T train-ai python notify.py --ntfy "测试：来自 trainAI
 配置了 webhook 就是**两条腿走路**：提醒表（打开页面能看到弹窗）+ 群消息（手机秒到）。
 没配 webhook 就退回原来的单通道。
 
+## 🔁 通知发失败会自动补发
+
+盯票命中的通知有三个出口（提醒服务 / 群机器人 / ntfy），任何一条失败都会被写进
+`notifications.jsonl` 队列，但**光写队列不够**——以前只有手动 `python notify.py --drain`
+才会重发，等于"任务显示命中了，人永远没收到"。
+
+现在 `watch-worker` 每 300 秒（`WATCH_DRAIN_SECONDS`）顺手补发一次，启动时也立刻补一次。
+队列文件放在 `./data/train` 卷里（`NOTIFY_QUEUE=/app/data/notifications.jsonl`），
+容器重建也不会丢。
+
+补发**只重发失败的那条通道**：payload 里记了 `channels`，比如「提醒服务挂了但 ntfy 通了」
+就只会重新 POST 提醒服务，不会让手机收到第二遍同样的消息。
+
+```bash
+# 看还有几条没发出去
+docker compose exec -T watch-worker python notify.py --pending
+# 手动补发一次（正常情况下 worker 会自己发，这条用于排查）
+docker compose exec -T watch-worker python notify.py --drain
+```
+
+实测链路：往队列里塞一条 → `drain` 返回 `{'sent': 1, 'left': 0}` → `reminders` 表出现对应一行。
+
+
 ## 🛰 常驻盯票进程（watch_worker.py）
 
 `Watcher.start()` 的轮询线程挂在 Streamlit 的 `session_state` 上，**关掉网页线程就没了**。
