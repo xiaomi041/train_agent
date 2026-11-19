@@ -13,6 +13,7 @@
 
 import json
 import os
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -25,6 +26,8 @@ WEBHOOK_TIMEOUT = float(os.getenv("NOTIFY_WEBHOOK_TIMEOUT", "5"))
 NTFY_TOPIC = os.getenv("NOTIFY_NTFY", "").strip()
 NTFY_SERVER = os.getenv("NOTIFY_NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 NTFY_TIMEOUT = float(os.getenv("NOTIFY_NTFY_TIMEOUT", "5"))
+# 同一件事多久内只通知一次（秒）。0 表示关闭去重。
+DEDUPE_SECONDS = float(os.getenv("NOTIFY_DEDUPE_SECONDS", "600"))
 
 
 def _post(payload: dict, url: str) -> dict:
@@ -121,15 +124,65 @@ def ntfy_push(text: str, topic: str = "", server: str = "") -> dict:
     return {"ok": True, "provider": "ntfy"}
 
 
-def send(content: str, at: str = "", repeat: str = "once", url: str = None) -> dict:
+def _sent_file() -> Path:
+    return QUEUE_FILE.with_name("notify_sent.jsonl")
+
+
+def _seen_recently(key: str, window: float) -> bool:
+    """同一个 key 在 window 秒内是否已经发过（跨进程，所以落文件）。"""
+    p = _sent_file()
+    if not p.exists():
+        return False
+    now = time.time()
+    keep = []
+    seen = False
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if now - float(item.get("t", 0)) > window:
+            continue          # 过期的顺手清掉，文件不会无限长
+        keep.append(item)
+        if item.get("k") == key:
+            seen = True
+    try:
+        p.write_text("".join(json.dumps(i, ensure_ascii=False) + "\n" for i in keep),
+                     encoding="utf-8")
+    except OSError:
+        pass
+    return seen
+
+
+def _mark_sent(key: str) -> None:
+    try:
+        with _sent_file().open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"k": key, "t": time.time()}, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def send(content: str, at: str = "", repeat: str = "once", url: str = None,
+         dedupe_key: str = "") -> dict:
     """发一条通知。at 为空表示「马上提醒」（1 分钟后，避免立刻过期）。
 
     三个通道（提醒服务 / 群机器人 / ntfy）各自独立，**哪条失败了就只补哪条**：
     payload 里的 `channels` 记下失败通道，`drain()` 只重试它们，成功的不重发，
     否则「提醒服务挂了但 ntfy 通了」这种情况下手机会收到两遍同样的消息。
+
+    `dedupe_key`：同一件事在 `NOTIFY_DEDUPE_SECONDS`（默认 600）秒内只发一次。
+    起因是真实踩到的——同一次命中被两个 tick 各通知一遍，界面上弹出两条一样的提醒。
     """
     if not content.strip():
         return {"ok": False, "error": "空内容"}
+    key = dedupe_key or content.strip()[:200]
+    if DEDUPE_SECONDS > 0 and _seen_recently(key, DEDUPE_SECONDS):
+        return {"ok": True, "deduped": True, "key": key}
+    _mark_sent(key)
     when = at or (datetime.now() + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
     payload = {
         "content": content.strip()[:500],

@@ -280,6 +280,13 @@ docker compose exec -T watch-worker python notify.py --drain
 
 实测链路：往队列里塞一条 → `drain` 返回 `{'sent': 1, 'left': 0}` → `reminders` 表出现对应一行。
 
+### 通知去重（NOTIFY_DEDUPE_SECONDS）
+
+同一次命中被两个 tick 各通知一遍时，界面上会出现两条一模一样的提醒（真实发生过）。
+现在 `notify.send(..., dedupe_key=...)` 用文件记录 keys（默认窗口 600 秒），同 key 只发一次；
+`Watcher` 命中时传的 key 是 `任务id|车次|席别|日期|开点`，换车次/换日期仍会正常提醒。
+发过的 key 存 `notify_sent.jsonl`（与队列同目录），过期记录在下次检查时顺手清掉。
+
 
 ## 🛰 常驻盯票进程（watch_worker.py）
 

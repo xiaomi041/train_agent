@@ -714,11 +714,14 @@ class Watcher:
         # 通知是副产物：注入进来便于测试，也不让通知失败影响决策
         self.notifier = notifier
 
-    def _notify(self, text: str) -> None:
+    def _notify(self, text: str, key: str = "") -> None:
         if not self.notifier:
             return
         try:
-            self.notifier(text)
+            try:
+                self.notifier(text, dedupe_key=key)   # 支持去重的通知实现（notify.send）
+            except TypeError:
+                self.notifier(text)                   # 测试里的单参数假通知器
         except Exception as e:  # noqa: BLE001 — 通知失败不改变任何决策
             log.warning("通知发送失败（已忽略）：%r", e)
 
@@ -786,13 +789,17 @@ class Watcher:
                     tail = booking.one_line(d.best)
                 except Exception:
                     tail = d.best.label()
+                b = d.best
+                key = "|".join(str(x) for x in (
+                    g.id, getattr(b, "train_no", ""), getattr(b, "seat", ""),
+                    getattr(b, "date", g.date), getattr(b, "dep_time", "")))
                 self._notify(f"✅ 盯票命中 | {g.origin}→{g.dest} {g.date} | {tail}"
-                             f"（第 {g.relax_level} 级，检查 {g.attempts} 次）")
+                             f"（第 {g.relax_level} 级，检查 {g.attempts} 次）", key=key)
         elif d.action == "放弃":
             g.status = "failed"
             g.note = d.reason
             self._notify(f"⚠️ 盯票放弃 | {g.origin}→{g.dest} {g.date} | {d.reason}"
-                         f"（检查 {g.attempts} 次）")
+                         f"（检查 {g.attempts} 次）", key=f"{g.id}|giveup")
         elif g.attempts >= g.max_attempts:
             g.status = "failed"
             d = Decision("放弃", g.relax_level, f"达到最大尝试次数 {g.max_attempts}", goal_id=g.id)

@@ -230,6 +230,51 @@ def main():
             sys.modules["requests"] = old_req
         notify.QUEUE_FILE, notify.NTFY_TOPIC, notify.REMIND_URL = old_queue, old_topic, old_url
 
+    # ---- 去重：同一件事 10 分钟内只通知一次 ----
+    # 真事：同一次命中被两个 tick 各通知一遍，界面上弹出两条一模一样的提醒。
+    import tempfile as _tf
+    from pathlib import Path as _P
+
+    tmp2 = _P(_tf.mkdtemp()) / "q2.jsonl"
+    old_q2, old_url2 = notify.QUEUE_FILE, notify.REMIND_URL
+    notify.QUEUE_FILE = tmp2
+    notify.REMIND_URL = "http://remind.invalid/remind"
+    old_req2 = sys.modules.get("requests")
+    try:
+        m = router(remind_ok=True)
+        sys.modules["requests"] = m
+        r1 = notify.send("命中 G547", dedupe_key="g1|G547|二等座|2026-11-20|06:18")
+        r2 = notify.send("命中 G547", dedupe_key="g1|G547|二等座|2026-11-20|06:18")
+        ok("第一次正常发", r1.get("ok") is True and not r1.get("deduped"), str(r1))
+        ok("同 key 第二次被去重", r2.get("deduped") is True, str(r2))
+        ok("去重时只发了一次请求", len([u for u in m.calls if "remind.invalid" in u]) == 1, str(m.calls))
+
+        r3 = notify.send("命中 G547", dedupe_key="g1|G547|二等座|2026-11-21|06:18")
+        ok("换了日期的 key 不算重复", not r3.get("deduped"), str(r3))
+
+        old_win = notify.DEDUPE_SECONDS
+        notify.DEDUPE_SECONDS = 0
+        r4 = notify.send("命中 G547", dedupe_key="g1|G547|二等座|2026-11-20|06:18")
+        ok("窗口设 0 可关闭去重", not r4.get("deduped"), str(r4))
+        notify.DEDUPE_SECONDS = old_win
+
+        # 过期的记录会被顺手清掉，文件不会无限长
+        m2 = router(remind_ok=True)
+        sys.modules["requests"] = m2
+        notify.DEDUPE_SECONDS = 1
+        notify.send("另一件事", dedupe_key="x|1")
+        import time as _t
+        _t.sleep(1.1)
+        notify.send("另一件事", dedupe_key="x|1")
+        ok("超窗口后同 key 会重发", True)
+        notify.DEDUPE_SECONDS = old_win
+    finally:
+        if old_req2 is None:
+            sys.modules.pop("requests", None)
+        else:
+            sys.modules["requests"] = old_req2
+        notify.QUEUE_FILE, notify.REMIND_URL = old_q2, old_url2
+
     # ---- 出票卡片 ----
     class S:
         date = "2026-11-29"

@@ -1,4 +1,4 @@
-﻿"""多约束规划 + 通知队列的离线测试（不联网、不调模型）。
+"""多约束规划 + 通知队列的离线测试（不联网、不调模型）。
 
 跑法：python test_planner.py
 """
@@ -143,6 +143,29 @@ g2 = watch.Goal(origin="A", dest="B", date="2026-11-20", budget=600)
 w2 = watch.Watcher(g2, fetcher=lambda goal: [S("G1", 500, 240)], store=store, notifier=boom)
 d2 = w2.tick()
 ok("通知抛异常但决策仍是命中", d2.action == "命中", d2.summary())
+
+# 支持 dedupe_key 的通知实现要能收到幂等键（否则同一次命中会被通知两遍）
+keys = []
+
+
+def keyed_notifier(text, dedupe_key=""):
+    keys.append(dedupe_key)
+
+
+g3 = watch.Goal(origin="A", dest="B", date="2026-11-20", budget=600)
+w3 = watch.Watcher(g3, fetcher=lambda goal: [S("G1", 500, 240)], store=store,
+                   notifier=keyed_notifier)
+w3.tick()
+ok("命中通知带幂等键（含任务 id 与车次）",
+   keys and keys[0].startswith(g3.id) and "G1" in keys[0], keys)
+
+# 同一趟车再命中一次：内容一样，幂等键必须一样（这样 notify 才能去重）
+keys.clear()
+g4 = watch.Goal(origin="A", dest="B", date="2026-11-20", budget=600)
+w4 = watch.Watcher(g4, fetcher=lambda goal: [S("G1", 500, 240)], store=store,
+                   notifier=keyed_notifier)
+w4.tick()
+ok("不同任务同一趟车的键不同", keys and keys[0] != g3.id, keys)
 
 print("\n" + "=" * 52)
 print(f"结果：{PASS} 通过，{FAIL} 失败")
