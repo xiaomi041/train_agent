@@ -52,6 +52,35 @@ VIOLATION_DEPART = "出发时段不合适"
 VIOLATION_SEAT = "席别不在偏好内"
 VIOLATION_TRANSFER_COUNT = "换乘次数超限"
 
+# 可以放宽的维度。规则版按固定顺序一级一级开，模型版由模型挑「下一个开哪个」。
+RELAX_ORDER = ["transfer", "date", "seat", "money", "time", "arrive"]
+RELAX_LABEL = {
+    "transfer": "允许中转",
+    "date": "日期前后浮动",
+    "seat": "不限席别",
+    "money": "预算上浮 20%",
+    "time": "耗时上浮 25%",
+    "arrive": "不限到达时段",
+}
+# 老的「等级」语义保留（0..4 对应固定的开关组合），只用于展示与兼容
+LEVEL_DIMS = {
+    0: [],
+    1: ["transfer"],
+    2: ["transfer", "date"],
+    3: ["transfer", "date", "seat"],
+    4: ["transfer", "date", "seat", "money", "time", "arrive"],
+}
+
+
+def relax_dims(goal: "Goal") -> set:
+    """任务当前已放宽的维度集合。
+
+    `relax_dims` 为空时按老语义从 `relax_level` 推——这样老数据、老测试都不用改。
+    """
+    if goal.relax_dims:
+        return set(goal.relax_dims)
+    return set(LEVEL_DIMS.get(min(goal.relax_level, 4), []))
+
 
 @dataclass
 class Goal:
@@ -75,7 +104,8 @@ class Goal:
     interval_sec: int = 300
     max_attempts: int = 288                    # 默认 288 次 ≈ 24h @5min
     status: str = "active"                     # active / done / failed / stopped
-    relax_level: int = 0                       # 0 严格 → 4 最宽
+    relax_level: int = 0                       # 0 严格 → 4 最宽（展示用）
+    relax_dims: list = field(default_factory=list)   # 实际放宽了哪些维度（模型可决定）
     attempts: int = 0
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     updated_at: str = ""
@@ -93,13 +123,14 @@ class Goal:
     def relaxed(self, level: int) -> "Goal":
         g = Goal.from_json(self.to_json())
         g.relax_level = level
+        g.relax_dims = list(LEVEL_DIMS.get(level, RELAX_ORDER))
         if level >= 2:
             g.flex_days = max(g.flex_days, 2)
         return g
 
     def date_window(self) -> list:
         base = datetime.strptime(self.date, "%Y-%m-%d").date()
-        if self.relax_level < 2:
+        if "date" not in relax_dims(self):
             return [base.isoformat()]
         out = []
         for d in range(-self.flex_days, self.flex_days + 1):
@@ -153,6 +184,7 @@ class Decision:
     closest: Optional[Scheme] = None
     candidates: int = 0
     violations: list = field(default_factory=list)
+    relax_dims: list = field(default_factory=list)   # 本次决定放宽的维度（最多一个）
 
     def summary(self) -> str:
         if self.action == "命中" and self.best:
@@ -189,22 +221,22 @@ def _arrive_dt(scheme: Scheme) -> datetime:
 def check(scheme: Scheme, goal: Goal) -> list:
     """返回违规项列表；空列表 = 满足全部约束。"""
     bad = []
-    level = goal.relax_level
+    dims = relax_dims(goal)
 
     if scheme.price > 0:
         budget = goal.budget
-        if level >= 4 and budget is not None:
+        if "money" in dims and budget is not None:
             budget = budget * 1.2
         if budget is not None and scheme.price > budget:
             bad.append(VIOLATION_PRICE)
 
     limit = goal.max_minutes
-    if level >= 4 and limit:
+    if "time" in dims and limit:
         limit = int(limit * 1.25)
     if limit and scheme.duration_min > limit:
         bad.append(VIOLATION_DURATION)
 
-    if level < 4:
+    if "arrive" not in dims:
         arr = _arrive_dt(scheme)
         after = arr.replace(hour=int(goal.arrive_after[:2]), minute=int(goal.arrive_after[3:5]))
         before = arr.replace(hour=int(goal.arrive_before[:2]), minute=int(goal.arrive_before[3:5]))
@@ -228,8 +260,8 @@ def check(scheme: Scheme, goal: Goal) -> list:
         elif n_transfer > goal.max_transfers:
             bad.append(VIOLATION_TRANSFER_COUNT)
 
-    # 席别约束：严格模式下只接受偏好列表内的席别（level>=3 放宽）
-    if goal.strict_seat and level < 3 and scheme.seat not in goal.seat_prefs:
+    # 席别约束：严格模式下只接受偏好列表内的席别（放宽「席别」后不再校验）
+    if goal.strict_seat and "seat" not in dims and scheme.seat not in goal.seat_prefs:
         bad.append(VIOLATION_SEAT)
 
     return bad
@@ -288,7 +320,7 @@ def real_fetcher(goal: Goal, hubs: Optional[list] = None, sleep_between: float =
                 seen.add(key)
                 out.append(s)
 
-    if goal.relax_level >= 1 and goal.allow_transfer and hubs:
+    if "transfer" in relax_dims(goal) and goal.allow_transfer and hubs:
         # 按"是否顺路"挑枢纽，而不是盲取列表前三个：
         # 北京→上海应该试南京/济南/徐州，而不是天津/石家庄。
         picked = geo.pick_hubs(goal.origin, goal.dest, hubs, k=HUB_QUERY_LIMIT)
@@ -303,7 +335,7 @@ def real_fetcher(goal: Goal, hubs: Optional[list] = None, sleep_between: float =
 
     # 两段换乘（A→h1→h2→D）：只有明确允许 2 次换乘、且放宽到第 2 级才试，
     # 否则请求数会翻几倍，而绝大多数行程一次换乘就够。
-    if goal.relax_level >= 2 and goal.allow_transfer and goal.max_transfers >= 2 and hubs:
+    if len(relax_dims(goal)) >= 2 and goal.allow_transfer and goal.max_transfers >= 2 and hubs:
         try:
             import route as _route
             picked2 = geo.pick_hubs(goal.origin, goal.dest, hubs, k=MULTI_HUB_LIMIT)
@@ -395,19 +427,54 @@ def _transfer_schemes(goal: Goal, hub: str, d: str, sleep_between: float) -> lis
 
 # ---------------------------------------------------------------- 决策
 
-MAX_LEVEL = 4
+# 可以放宽的维度总数就是「最多能升几级」；老代码里写死的 4 已经不够用了
+# 模型版连续说「先等等」的上限，用完退回规则顺序，避免任务卡在原地
+MAX_MODEL_WAITS = int(__import__('os').getenv('DECIDE_MAX_WAITS', '3'))
+MAX_LEVEL = len(RELAX_ORDER)
+
+# 决策器：决定「下一个放宽哪一项」。签名见 pick_dim()，返回维度名或 None（=先不放宽）。
+Decider = Callable[[Goal, list, list, Optional[Scheme], list], Optional[str]]
 
 
-def decide(schemes: list, goal: Goal) -> Decision:
+def pick_dim(goal: Goal, decider: Optional[Decider] = None,
+             best: Optional[Scheme] = None, bad: Optional[list] = None) -> Optional[str]:
+    """挑「下一个该放宽的维度」。
+
+    没有 decider 或 decider 抛异常时退回固定顺序（=规则版行为），
+    这样模型挂了也不会让盯票停摆。
+    """
+    dims = relax_dims(goal)
+    remaining = [d for d in RELAX_ORDER if d not in dims]
+    if not remaining:
+        return None
+    if decider is not None:
+        try:
+            choice = decider(goal, sorted(dims), remaining, best, bad or [])
+        except Exception as e:  # noqa: BLE001 — 决策器出错退回规则，不中断盯票
+            log.warning("决策器异常，退回固定顺序：%r", e)
+            choice = None
+        else:
+            if choice in remaining:
+                return choice
+            if choice is None:
+                return None
+    return remaining[0]
+
+
+def decide(schemes: list, goal: Goal, decider: Optional[Decider] = None) -> Decision:
     """根据本轮观察决定下一步。这是「自主推进」的落点，也是评测的断言对象。"""
     goal_id = goal.id
+    dims = relax_dims(goal)
     if not schemes:
         # 一条都没有 = 现在没票（还没放票 / 已售罄 / 该日期已过）。
         # 这种情况**不能**判定放弃：昨天没有今天可能有，盯票的价值就在于等。
         # 前两级仍然要扩搜（放开中转、放开日期弹性），因为"没票"也可能是搜得太窄。
-        if goal.relax_level < 2:
-            return Decision("降级", goal.relax_level + 1, "本轮没有任何可买方案，先扩大搜索范围",
-                            goal_id=goal_id)
+        if len(dims) < 2:
+            nxt = pick_dim(goal, decider)
+            if nxt:
+                return Decision("降级", len(dims) + 1,
+                                f"本轮没有任何可买方案，放宽「{RELAX_LABEL[nxt]}」再搜",
+                                goal_id=goal_id, relax_dims=[nxt])
         return Decision("等待", goal.relax_level, "本轮无票（搜索范围已放开），继续盯", goal_id=goal_id)
 
     ordered = rank(schemes, goal)
@@ -417,12 +484,18 @@ def decide(schemes: list, goal: Goal) -> Decision:
         return Decision("命中", goal.relax_level, "约束全部满足", goal_id=goal_id,
                         best=best, candidates=len(schemes))
 
-    if goal.relax_level < MAX_LEVEL:
-        return Decision(
-            "降级", goal.relax_level + 1,
-            f"最优候选「{best.train_no}」{'；'.join(bad)}",
-            goal_id=goal_id, closest=best, candidates=len(schemes), violations=bad,
-        )
+    if len(dims) < len(RELAX_ORDER):
+        nxt = pick_dim(goal, decider, best, bad)
+        if nxt:
+            return Decision(
+                "降级", len(dims) + 1,
+                f"最优候选「{best.train_no}」{'；'.join(bad)} → 放宽「{RELAX_LABEL[nxt]}」",
+                goal_id=goal_id, closest=best, candidates=len(schemes), violations=bad,
+                relax_dims=[nxt],
+            )
+        return Decision("等待", goal.relax_level,
+                        f"最优候选「{best.train_no}」{'；'.join(bad)}，但先不放宽（等新票）",
+                        goal_id=goal_id, closest=best, candidates=len(schemes), violations=bad)
     return Decision("放弃", goal.relax_level, f"最宽条件下仍不满足：{'；'.join(bad)}",
                     goal_id=goal_id, closest=best, candidates=len(schemes), violations=bad)
 
@@ -702,7 +775,8 @@ class Watcher:
 
     def __init__(self, goal: Goal, fetcher: Fetcher, store: Store,
                  sleep: Callable[[float], None] = time.sleep, jitter: float = 0.2,
-                 notifier: Optional[Callable[[str], dict]] = None):
+                 notifier: Optional[Callable[[str], dict]] = None,
+                 decider: Optional[Decider] = None):
         self.goal = goal
         self.fetcher = fetcher
         self.store = store
@@ -713,6 +787,18 @@ class Watcher:
         self.last: Optional[Decision] = None
         # 通知是副产物：注入进来便于测试，也不让通知失败影响决策
         self.notifier = notifier
+        # 决策器：None = 规则版（固定顺序），传入模型版即可让模型挑放宽哪一项
+        self.decider = decider
+        # 模型版的「先等等」预算：用完之后退回规则顺序，避免一直等下去不动
+        self._model_waits = 0
+
+    def _apply_relax(self, d: Decision) -> None:
+        """把「这次要放宽的维度」写回任务，并让 relax_level 跟着它走。"""
+        dims = set(self.goal.relax_dims) or relax_dims(self.goal)
+        for dim in (d.relax_dims or []):
+            dims.add(dim)
+        self.goal.relax_dims = [x for x in RELAX_ORDER if x in dims]
+        self.goal.relax_level = min(len(RELAX_ORDER), len(self.goal.relax_dims))
 
     def _notify(self, text: str, key: str = "") -> None:
         if not self.notifier:
@@ -732,6 +818,9 @@ class Watcher:
         g.attempts += 1
         candidates = 0
         escalated = False
+        # 模型说「等等」的次数用完后就退回规则，否则任务会一直等下去不动。
+        # 这里的 use_decider 在整个 tick 内固定，避免"升了一级又立刻被模型劝住"。
+        use_decider = None if self._model_waits >= MAX_MODEL_WAITS else self.decider
         d = Decision("等待", g.relax_level, "本轮未执行", goal_id=g.id)
 
         for _ in range(2):  # 本轮 + 降级后立即重试一次
@@ -741,23 +830,30 @@ class Watcher:
             except FetchError as e:
                 # 第 1 类：暂时性错误 → 前两次只等，第 3 次判定「这条查法不行」转降级
                 self._err_streak = getattr(self, "_err_streak", 0) + 1
-                if self._err_streak >= 3 and g.relax_level < MAX_LEVEL and not escalated:
-                    d = Decision("降级", g.relax_level + 1,
-                                 f"连续 {self._err_streak} 次抓取失败：{e}", goal_id=g.id)
-                    g.relax_level = d.level
-                    self._err_streak = 0
-                    escalated = True
-                    continue
+                if self._err_streak >= 3 and len(relax_dims(g)) < len(RELAX_ORDER) and not escalated:
+                    nxt = pick_dim(g, self.decider)
+                    if nxt:
+                        d = Decision("降级", g.relax_level + 1,
+                                     f"连续 {self._err_streak} 次抓取失败：{e} → 放宽「{RELAX_LABEL[nxt]}」",
+                                     goal_id=g.id, relax_dims=[nxt])
+                        self._apply_relax(d)
+                        self._err_streak = 0
+                        escalated = True
+                        continue
                 d = Decision("等待", g.relax_level, f"抓取失败将重试：{e}", goal_id=g.id)
                 break
             except DataError as e:
                 # 第 2 类：数据缺失 → 立刻换查法，不浪费重试次数
                 self._err_streak = 0
-                if g.relax_level < MAX_LEVEL and not escalated:
-                    d = Decision("降级", g.relax_level + 1, f"数据不可用：{e}", goal_id=g.id)
-                    g.relax_level = d.level
-                    escalated = True
-                    continue
+                if len(relax_dims(g)) < len(RELAX_ORDER) and not escalated:
+                    nxt = pick_dim(g, self.decider)
+                    if nxt:
+                        d = Decision("降级", g.relax_level + 1,
+                                     f"数据不可用：{e} → 放宽「{RELAX_LABEL[nxt]}」",
+                                     goal_id=g.id, relax_dims=[nxt])
+                        self._apply_relax(d)
+                        escalated = True
+                        continue
                 d = Decision("放弃", g.relax_level, f"数据不可用且已无退路：{e}", goal_id=g.id)
                 break
             except Exception as e:
@@ -766,19 +862,22 @@ class Watcher:
                 break
 
             candidates = len(schemes)
-            d = decide(schemes, g)
+            d = decide(schemes, g, use_decider)
+            if d.action == "等待" and use_decider is not None and d.closest is not None:
+                self._model_waits += 1
             if d.action == "降级":
                 if escalated:  # 一个 tick 只升一级，避免一次 tick 跳过中间档位
                     d = Decision("等待", g.relax_level,
                                  f"第 {g.relax_level} 级仍无满足方案（{d.reason}），下一轮继续",
                                  goal_id=g.id, closest=d.closest, candidates=candidates)
                     break
-                g.relax_level = d.level
+                self._apply_relax(d)
                 escalated = True
                 continue  # 第 3 类：目标不可达 → 放宽后立刻用新层级再看一次
             break
 
         if d.action == "命中":
+            self._model_waits = 0
             g.status = "done"
             g.note = d.best.label() if d.best else ""
             if d.best:

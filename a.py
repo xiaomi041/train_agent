@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 import streamlit as st
 from agno.agent import Agent
 import booking
+import decider
 import notify
 import planner
 import watch
@@ -894,7 +895,8 @@ if _wgoals:
             bc1, bc2 = st.columns([1.2, 3.8])
             if g.status == "active" and bc1.button("立即检查一次", key=f"tick_{g.id}"):
                 with st.spinner("查一次 12306..."):
-                    d = watch.Watcher(g, fetcher=_watch_fetcher, store=_wstore, notifier=notify.send).tick()
+                    d = watch.Watcher(g, fetcher=_watch_fetcher, store=_wstore, notifier=notify.send,
+                                        decider=decider.make_decider(os.getenv("DECIDE_MODE", "rule"))).tick()
                 st.info(d.summary())
                 st.rerun()
             if g.status == "active" and bc2.button("停止这个任务", key=f"stop_{g.id}"):
@@ -906,6 +908,9 @@ if _wgoals:
                 # 这里不再提供"在本页开线程"的按钮 —— 那会造成两个轮询器重复查接口。
                 st.caption(f"🛰 后台常驻进程每 {g.interval_sec} 秒检查一次（没票时自动退避到最多 4 倍间隔），"
                            "关掉本页也会继续；命中后通过提醒服务通知你。")
+                _mode = os.getenv("DECIDE_MODE", "rule")
+                st.caption(("本轮放宽策略：模型挑选（llm）" if _mode == "llm" else "本轮放宽策略：固定顺序（rule）")
+                           + "；已放宽：" + ("、".join(watch.RELAX_LABEL[d] for d in watch.relax_dims(g)) or "无"))
 
             with st.expander(f"决策记录（最近 {min(len(_wstore.events(g.id, 50)), 50)} 条）"):
                 rows = _wstore.events(g.id, 50)

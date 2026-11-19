@@ -34,6 +34,7 @@ from typing import Callable, Optional
 
 import notify
 import watch
+import decider as decider_mod
 
 LOG_FORMAT = "%(asctime)s %(levelname)-5s [%(name)s] %(message)s"
 logging.basicConfig(
@@ -83,11 +84,15 @@ class WatchWorker:
         notifier: Optional[Callable[[str], dict]] = None,
         clock: Callable[[], float] = time.time,
         drainer: Optional[Callable[[], dict]] = None,
+        decider=None,
     ):
         self.store = store or watch.Store()
         self.fetcher = fetcher or watch.real_fetcher
         self.notifier = notifier if notifier is not None else notify.send
         self.drainer = drainer if drainer is not None else notify.drain
+        # 放宽策略：DECIDE_MODE=rule（默认，零成本）或 llm（让模型挑放宽哪一项）
+        self.decider = decider if decider is not None else \
+            decider_mod.make_decider(os.getenv("DECIDE_MODE", "rule"))
         self.clock = clock
         self._due: dict[str, float] = {}
         self._backoff: dict[str, float] = {}
@@ -174,7 +179,8 @@ class WatchWorker:
     def _run_one(self, goal: watch.Goal, now: float) -> dict:
         before_level = goal.relax_level
         try:
-            d = watch.Watcher(goal, self.fetcher, self.store, notifier=self.notifier).tick()
+            d = watch.Watcher(goal, self.fetcher, self.store, notifier=self.notifier,
+                                   decider=self.decider).tick()
         except Exception as e:
             log.warning("任务 %s 执行异常（保留任务，下轮重试）：%r", goal.id, e)
             with self._lock:
